@@ -1,0 +1,31 @@
+{
+  "name": "minecraft-companion",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "ts-node src/bot.ts",
+    "build": "tsc",
+    "start": "node dist/bot.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CDX-1/minecraft-companion.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/CDX-1/minecraft-companion/issues"
+  },
+  "homepage": "https://github.com/CDX-1/minecraft-companion#readme",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "mineflayer": "^4.37.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.3"
+  }
+}
