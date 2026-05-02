@@ -9,7 +9,14 @@ async function main() {
   console.log('║    Minecraft Companion TUI   ║');
   console.log('╚══════════════════════════════╝\n');
 
-  const config: BotConfig = await inquirer.prompt([
+  const envElevenLabsEnabled = process.env.ELEVENLABS_ENABLED === 'true';
+  const envElevenLabsApiKey = process.env.ELEVENLABS_API_KEY?.trim();
+  const envElevenLabsVoiceId = process.env.ELEVENLABS_VOICE_ID?.trim();
+  const envElevenLabsModelId = process.env.ELEVENLABS_MODEL_ID?.trim() || 'eleven_turbo_v2_5';
+  const envElevenLabsStability = Number(process.env.ELEVENLABS_STABILITY) || 0.4;
+  const envElevenLabsSimilarityBoost = Number(process.env.ELEVENLABS_SIMILARITY_BOOST) || 0.75;
+
+  const answers = await inquirer.prompt([
     {
       type: 'input',
       name: 'host',
@@ -63,14 +70,15 @@ async function main() {
       type: 'confirm',
       name: 'elevenLabsEnabled',
       message: 'Enable ElevenLabs voice synthesis?',
-      default: process.env.ELEVENLABS_ENABLED === 'true',
+      default: envElevenLabsEnabled,
+      when: () => !envElevenLabsEnabled,
     },
     {
       type: 'password',
       name: 'elevenLabsApiKey',
       message: 'ElevenLabs API key:',
-      default: process.env.ELEVENLABS_API_KEY ?? '',
-      when: (answers) => answers.elevenLabsEnabled,
+      default: envElevenLabsApiKey ?? '',
+      when: (answers) => !envElevenLabsEnabled && answers.elevenLabsEnabled,
       filter: (value: string) => value.trim() || undefined,
       validate: (value: string) => (value.trim().length ? true : 'API key is required'),
     },
@@ -78,8 +86,8 @@ async function main() {
       type: 'input',
       name: 'elevenLabsVoiceId',
       message: 'ElevenLabs voice ID:',
-      default: process.env.ELEVENLABS_VOICE_ID ?? '',
-      when: (answers) => answers.elevenLabsEnabled,
+      default: envElevenLabsVoiceId ?? '',
+      when: (answers) => !envElevenLabsEnabled && answers.elevenLabsEnabled,
       filter: (value: string) => value.trim() || undefined,
       validate: (value: string) => (value.trim().length ? true : 'Voice ID is required'),
     },
@@ -87,25 +95,35 @@ async function main() {
       type: 'input',
       name: 'elevenLabsModelId',
       message: 'ElevenLabs model ID:',
-      default: process.env.ELEVENLABS_MODEL_ID ?? 'eleven_turbo_v2_5',
-      when: (answers) => answers.elevenLabsEnabled,
-      filter: (value: string) => value.trim() || 'eleven_turbo_v2_5',
+      default: envElevenLabsModelId,
+      when: (answers) => !envElevenLabsEnabled && answers.elevenLabsEnabled,
+      filter: (value: string) => value.trim() || envElevenLabsModelId,
     },
     {
       type: 'number',
       name: 'elevenLabsStability',
       message: 'ElevenLabs stability (0.0 - 1.0):',
-      default: Number(process.env.ELEVENLABS_STABILITY) || 0.4,
-      when: (answers) => answers.elevenLabsEnabled,
+      default: envElevenLabsStability,
+      when: (answers) => !envElevenLabsEnabled && answers.elevenLabsEnabled,
     },
     {
       type: 'number',
       name: 'elevenLabsSimilarityBoost',
       message: 'ElevenLabs similarity boost (0.0 - 1.0):',
-      default: Number(process.env.ELEVENLABS_SIMILARITY_BOOST) || 0.75,
-      when: (answers) => answers.elevenLabsEnabled,
+      default: envElevenLabsSimilarityBoost,
+      when: (answers) => !envElevenLabsEnabled && answers.elevenLabsEnabled,
     },
   ]);
+
+  const config: BotConfig = {
+    ...answers,
+    elevenLabsEnabled: envElevenLabsEnabled ? true : answers.elevenLabsEnabled ?? false,
+    elevenLabsApiKey: envElevenLabsApiKey ?? answers.elevenLabsApiKey,
+    elevenLabsVoiceId: envElevenLabsVoiceId ?? answers.elevenLabsVoiceId,
+    elevenLabsModelId: envElevenLabsModelId ?? answers.elevenLabsModelId,
+    elevenLabsStability: envElevenLabsStability ?? answers.elevenLabsStability,
+    elevenLabsSimilarityBoost: envElevenLabsSimilarityBoost ?? answers.elevenLabsSimilarityBoost,
+  };
 
   launchUI(config);
 }
