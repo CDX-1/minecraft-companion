@@ -5,6 +5,12 @@ import type { Bot } from 'mineflayer';
 import { Movements, goals } from 'mineflayer-pathfinder';
 import { Vec3 } from 'vec3';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
+import { BuildSession, BuildStatus } from './services/builder';
+import { buildFromPrompt } from './services/geminiBuilder';
+
+function looksLikeBuildIntent(message: string): boolean {
+  return /\b(build|construct|erect|put up|create me|design me|make me a|spawn me a|tower|house|castle|villa|mansion|dome|sphere|pyramid|wall|bridge|arch|cube|staircase|obelisk|fountain|temple|shrine|cathedral|church|cottage|dock|pier|statue|monument|sakura|cherry blossom|dragon|death star)\b/i.test(message);
+}
 
 export type LlmProvider = 'openai' | 'gemini';
 export type Personality = 'friendly' | 'flirty' | 'tsundere' | 'arrogant';
@@ -184,6 +190,17 @@ TOOL SELECTION GUIDE:
 - Smelting: smelt_item handles the whole process — fuel, waiting, output
 - Notes: use write_note to record finds (coords, chest contents, resource spots) and read_notes to recall them
 - Inventory pressure: if Inv shows 32+/36 slots used, warn the player and suggest depositing to a nearby chest
+
+BUILDING:
+Build requests ("build a castle", "make me a tower") are handled OUTSIDE your tool loop by a dedicated Gemini-powered pipeline that generates a schematic and places it. You will not see those requests — they are intercepted before reaching you.
+- build_demolish removes the active structure. build_cancel aborts an in-flight build (use if user says "stop" mid-build).
+- quick_setblock / quick_fill / quick_clear are for one-off ops (single block, region fill, clearing space) — NEVER use them for full structures.
+- All build tools require the bot to be op (server operator). If commands fail, tell the player to /op the bot.
+
+CHAT RULES:
+- Keep every chat message under 100 characters (hard Minecraft limit)
+- One short sentence max — casual and direct
+- Only reply once at the end, never narrate each step
 
 ${PERSONA_PROMPTS[personality]}`;
 }
@@ -986,6 +1003,81 @@ const TOOLS: ChatCompletionTool[] = [
       parameters: { type: 'object', properties: {} },
     },
   },
+
+  // ───────── Build control tools ─────────
+  {
+    type: 'function',
+    function: {
+      name: 'build_demolish',
+      description: 'Tear down the active structure (clears its blocks to air) and forget it. Use when the player says "delete it", "tear it down", "remove that".',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'build_cancel',
+      description: 'Abort an in-flight build mid-animation. Use when the player says "stop" while a structure is being placed.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'build_status',
+      description: 'Inspect the active build (phase, blocks placed, total, bounds, material).',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'quick_setblock',
+      description: 'Place a single block at exact coordinates via /setblock (op required). Use only for one-off placements outside a design — not for whole structures.',
+      parameters: {
+        type: 'object',
+        required: ['x', 'y', 'z', 'block'],
+        properties: {
+          x: { type: 'number' },
+          y: { type: 'number' },
+          z: { type: 'number' },
+          block: { type: 'string', description: 'Block name (e.g. "stone", "minecraft:oak_planks")' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'quick_fill',
+      description: 'Fill a cuboid region with a block via /fill (op required). For clearing space, set block to "air" or use quick_clear.',
+      parameters: {
+        type: 'object',
+        required: ['x1', 'y1', 'z1', 'x2', 'y2', 'z2', 'block'],
+        properties: {
+          x1: { type: 'number' }, y1: { type: 'number' }, z1: { type: 'number' },
+          x2: { type: 'number' }, y2: { type: 'number' }, z2: { type: 'number' },
+          block: { type: 'string' },
+          hollow: { type: 'boolean', description: 'Only place blocks on the shell (default false)' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'quick_clear',
+      description: 'Clear a cuboid region (fills with air). Use to make space before building.',
+      parameters: {
+        type: 'object',
+        required: ['x1', 'y1', 'z1', 'x2', 'y2', 'z2'],
+        properties: {
+          x1: { type: 'number' }, y1: { type: 'number' }, z1: { type: 'number' },
+          x2: { type: 'number' }, y2: { type: 'number' }, z2: { type: 'number' },
+        },
+      },
+    },
+  },
 ];
 
 export class MinecraftAgent {
@@ -1015,12 +1107,15 @@ export class MinecraftAgent {
   private notes = new Map<string, string>();
   private currentSender = '';
   private onAutonomousMessage?: (msg: string) => void;
+  private builder: BuildSession;
+  private onBuildStatus?: (status: BuildStatus) => void;
 
   constructor(
     private bot: Bot,
     options: string | MinecraftAgentOptions,
     private log: (msg: string) => void,
-    onAutonomousMessage?: (msg: string) => void
+    onAutonomousMessage?: (msg: string) => void,
+    onBuildStatus?: (status: BuildStatus) => void
   ) {
     const resolvedOptions: MinecraftAgentOptions = typeof options === 'string'
       ? { provider: 'openai', apiKey: options }
@@ -1036,9 +1131,20 @@ export class MinecraftAgent {
       this.openai = new OpenAI({ apiKey: this.apiKey });
     }
 
+    this.builder = new BuildSession(bot, log);
+    this.onBuildStatus = onBuildStatus;
+
     this.loadMemory();
     this.onAutonomousMessage = onAutonomousMessage;
     if (onAutonomousMessage) this.startProactiveHooks();
+  }
+
+  getBuildStatus(): BuildStatus {
+    return this.builder.getStatus();
+  }
+
+  private emitBuildStatus(): void {
+    this.onBuildStatus?.(this.builder.getStatus());
   }
 
   private createEmptyMemory(): AgentMemory {
@@ -1214,6 +1320,17 @@ export class MinecraftAgent {
     const fast = this.tryFastPath(message, sender);
     if (fast !== null) return fast;
 
+    if (looksLikeBuildIntent(message)) {
+      this.currentSender = sender;
+      try {
+        return await this.runGeminiBuild(message, sender);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.log(`[gemini-build] failed: ${msg}`);
+        return `Build failed: ${msg.slice(0, 80)}`;
+      }
+    }
+
     const bot = this.bot;
     const pos = bot.entity?.position;
 
@@ -1279,6 +1396,7 @@ export class MinecraftAgent {
       { role: 'user', content: `${sender} says: "${message}"` },
     ];
 
+    this.currentSender = sender;
     let iterations = 0;
     while (iterations++ < 16) {
       const response = await this.openai.chat.completions.create({
@@ -1328,7 +1446,6 @@ export class MinecraftAgent {
     this.history = firstUser >= 0 ? raw.slice(firstUser) : [];
     return "I got confused. Try again?";
   }
-
 
   private async handleGeminiMessage(message: string, sender: string, state: string): Promise<string> {
     const contents: GeminiContent[] = [
@@ -1969,6 +2086,33 @@ export class MinecraftAgent {
 
     const p = bot.entity!.position;
     return `Built up ${placed} block(s); now at (${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)})`;
+  }
+
+  private async runGeminiBuild(message: string, sender: string): Promise<string> {
+    const bot = this.bot;
+    const playerEntity = bot.players[sender]?.entity;
+    const playerCtx = playerEntity
+      ? { position: { x: playerEntity.position.x, y: playerEntity.position.y, z: playerEntity.position.z }, yaw: playerEntity.yaw }
+      : undefined;
+
+    this.log(`[gemini-build] generating: "${message}"`);
+    const generated = await buildFromPrompt(message, this.log);
+    if (!generated.blocks.length) return "Gemini didn't return any blocks. Try rephrasing?";
+
+    const origin = this.builder.defaultOrigin(playerCtx);
+    const cx = Math.floor(generated.width / 2);
+    const cz = Math.floor(generated.length / 2);
+    const placed = generated.blocks.map(b => ({
+      x: origin.x + b.x - cx,
+      y: origin.y + b.y,
+      z: origin.z + b.z - cz,
+      block: b.block,
+    }));
+    const desc = `${generated.description} (${generated.width}×${generated.height}×${generated.length}, ${placed.length} blocks)`;
+    const { status } = await this.builder.replay(placed, desc, origin, s => this.onBuildStatus?.(s));
+    if (status.phase === 'error') return `Build failed: ${status.message ?? 'unknown'}`;
+    if (status.phase === 'cancelled') return `Build cancelled at ${status.placed}/${status.total}`;
+    return `Built it — ${placed.length} blocks at (${origin.x},${origin.y},${origin.z}).`;
   }
 
   private makeVec3(x: number, y: number, z: number) {
@@ -2919,6 +3063,49 @@ export class MinecraftAgent {
         return Array.from(this.notes.entries())
           .map(([k, v]) => `${k}: ${v}`)
           .join('\n');
+      }
+
+      // ───────── Build control ─────────
+
+      case 'build_demolish': {
+        if (!this.builder.hasActive()) return 'Nothing to demolish';
+        const status = await this.builder.demolish(s => this.onBuildStatus?.(s));
+        return status.phase === 'error' ? `Demolish failed: ${status.message}` : 'Demolished';
+      }
+
+      case 'build_cancel': {
+        this.builder.cancelBuild();
+        this.emitBuildStatus();
+        return 'Build cancelled';
+      }
+
+      case 'build_status': {
+        return JSON.stringify(this.builder.getStatus());
+      }
+
+      case 'quick_setblock': {
+        const { x, y, z, block } = args as { x: number; y: number; z: number; block: string };
+        await this.builder.setBlockAt(x, y, z, block);
+        return `setblock ${block} at (${x},${y},${z})`;
+      }
+
+      case 'quick_fill': {
+        const { x1, y1, z1, x2, y2, z2, block, hollow = false } = args as {
+          x1: number; y1: number; z1: number;
+          x2: number; y2: number; z2: number;
+          block: string; hollow?: boolean;
+        };
+        const n = await this.builder.fillRegion(x1, y1, z1, x2, y2, z2, block, hollow as boolean);
+        return `Filled ${n} blocks with ${block}${hollow ? ' (hollow)' : ''}`;
+      }
+
+      case 'quick_clear': {
+        const { x1, y1, z1, x2, y2, z2 } = args as {
+          x1: number; y1: number; z1: number;
+          x2: number; y2: number; z2: number;
+        };
+        const n = await this.builder.clearRegion(x1, y1, z1, x2, y2, z2);
+        return `Cleared ${n} blocks`;
       }
 
       default:

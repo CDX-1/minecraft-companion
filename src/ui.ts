@@ -7,6 +7,7 @@ import { BotConfig } from './config';
 import { MinecraftAgent } from './agent';
 import { GlobalPushToTalk, startGlobalPushToTalk } from './globalPushToTalk';
 import { createElevenLabsSpeaker, ElevenLabsSpeaker } from './services/elevenLabs';
+import { BuildStatus } from './services/builder';
 import { startVoiceServer, VoiceServer } from './voiceServer';
 
 const armorManager = require('mineflayer-armor-manager');
@@ -276,18 +277,44 @@ export function launchUI(config: BotConfig): void {
     }
   }
 
+  function buildStatusBlock(s: BuildStatus): string {
+    if (s.phase === 'idle') return '';
+    const phaseColor =
+      s.phase === 'building' ? 'magenta-fg' :
+      s.phase === 'done' ? 'green-fg' :
+      s.phase === 'cancelled' ? 'gray-fg' :
+      s.phase === 'error' ? 'red-fg' : 'white-fg';
+    const pct = s.total ? Math.floor((s.placed / s.total) * 100) : 0;
+    const barWidth = 14;
+    const filled = Math.floor((pct / 100) * barWidth);
+    const bar = '█'.repeat(filled) + '░'.repeat(barWidth - filled);
+    const o = s.origin;
+    const mat = s.material ? s.material.replace(/^minecraft:/, '') : '';
+    const lines = [
+      `\n{bold}Build{/bold}`,
+      ` {${phaseColor}}${s.phase}{/${phaseColor}}` + (s.type ? ` · ${s.type}` : ''),
+      mat ? ` ${mat}` : '',
+      o ? ` @ (${o.x},${o.y},${o.z})` : '',
+      ` [${bar}] ${pct}%`,
+      ` ${s.placed}/${s.total} blocks`,
+    ];
+    return lines.filter(Boolean).join('\n');
+  }
+
   function renderInfo() {
     if (!bot?.entity) return;
     const hp = (bot.health ?? 0).toFixed(1);
     const food = bot.food ?? 0;
     const pos = bot.entity.position;
+    const buildStatus = agent?.getBuildStatus();
     infoPanel.setContent(
       `{bold}Link{/bold}\n {green-fg}online{/green-fg} ${config.host}:${config.port}\n\n` +
       `{bold}Callsign{/bold}\n ${bot.username}\n\n` +
       `{bold}Vitals{/bold}\n {red-fg}HP ${hp}/20{/red-fg}\n {green-fg}Food ${food}/20{/green-fg}\n\n` +
       `{bold}Coordinates{/bold}\n X ${pos.x.toFixed(1)}\n Y ${pos.y.toFixed(1)}\n Z ${pos.z.toFixed(1)}\n\n` +
       `{bold}Agent{/bold}\n ${agent ? '{green-fg}online{/green-fg}' : '{yellow-fg}basic commands{/yellow-fg}'}\n\n` +
-      `{bold}Voice{/bold}\n ${voiceServer ? '{magenta-fg}listening page live{/magenta-fg}' : config.voiceEnabled ? '{yellow-fg}starting{/yellow-fg}' : '{gray-fg}disabled{/gray-fg}'}`
+      `{bold}Voice{/bold}\n ${voiceServer ? '{magenta-fg}listening page live{/magenta-fg}' : config.voiceEnabled ? '{yellow-fg}starting{/yellow-fg}' : '{gray-fg}disabled{/gray-fg}'}` +
+      (buildStatus ? buildStatusBlock(buildStatus) : '')
     );
     screen.render();
   }
@@ -320,13 +347,30 @@ export function launchUI(config: BotConfig): void {
       void (bot as any).armorManager?.equipAll?.().catch?.(() => undefined);
 
       if (openaiApiKey) {
-        agent = new MinecraftAgent(bot, { provider: 'openai', apiKey: openaiApiKey, personality: config.personality }, (msg) => {
-          logAgent(msg);
-        }, (msg) => {
-          chatLog.log(`{yellow-fg}[auto]{/yellow-fg} ${msg}`);
-          botSay(msg);
-          screen.render();
-        });
+        agent = new MinecraftAgent(
+          bot,
+          { provider: 'openai', apiKey: openaiApiKey, personality: config.personality },
+          (msg) => {
+            logAgent(msg);
+          },
+          (msg) => {
+            chatLog.log(`{yellow-fg}[auto]{/yellow-fg} ${msg}`);
+            botSay(msg);
+            screen.render();
+          },
+          (status) => {
+            if (status.phase === 'building' && status.placed === 0) {
+              chatLog.log(`{magenta-fg}[build] ${status.description} — ${status.total} block changes{/magenta-fg}`);
+            } else if (status.phase === 'done') {
+              chatLog.log(`{green-fg}[build] ✓ ${status.description}{/green-fg}`);
+            } else if (status.phase === 'cancelled') {
+              chatLog.log(`{gray-fg}[build] cancelled at ${status.placed}/${status.total}{/gray-fg}`);
+            } else if (status.phase === 'error') {
+              chatLog.log(`{red-fg}[build] error: ${status.message}{/red-fg}`);
+            }
+            renderInfo();
+          },
+        );
         logAgent('GPT-4o-mini ready.');
       } else {
         logWarning('No OPENAI_API_KEY; using basic commands only.');

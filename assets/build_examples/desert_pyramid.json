@@ -1,0 +1,17 @@
+{
+  "id": "desert_pyramid",
+  "name": "Sandstone Desert Pyramid",
+  "structureType": "pyramid",
+  "tags": ["desert", "egyptian", "sandstone", "tomb", "ancient", "pyramid"],
+  "description": "Stepped sandstone pyramid with smooth-sandstone trim along the edges. Sun-bleached and severe — feels like a sealed tomb in a vast desert.",
+  "palette": {
+    "primary": "minecraft:sandstone",
+    "accent": "minecraft:smooth_sandstone",
+    "glass": "minecraft:glass",
+    "decoration": ["minecraft:chiseled_sandstone"]
+  },
+  "dimensions": { "width": 15, "depth": 15, "height": 8 },
+  "params": { "size": 15, "hollow": 0, "stepped": 1 },
+  "source": "manual",
+  "notes": "Odd sizes only (size auto-rounds to odd). Hollow pyramids read as tombs; solid feels like a monument."
+}

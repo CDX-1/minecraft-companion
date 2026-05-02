@@ -1,0 +1,17 @@
+{
+  "id": "garden_fountain",
+  "name": "Italian Garden Fountain",
+  "structureType": "fountain",
+  "tags": ["garden", "decorative", "fountain", "elegant", "courtyard", "stone", "ornate"],
+  "description": "Small circular fountain with a polished granite rim, water basin, and central spout. Looks like the centerpiece of a formal courtyard or villa garden.",
+  "palette": {
+    "primary": "minecraft:polished_granite",
+    "accent": "minecraft:smooth_stone",
+    "glass": "minecraft:glass",
+    "decoration": ["minecraft:water"]
+  },
+  "dimensions": { "width": 9, "depth": 9, "height": 6 },
+  "params": { "radius": 4 },
+  "source": "manual",
+  "notes": "Compact, decorative. Radius 3-4 fits a courtyard; radius 6+ is a town square centerpiece."
+}

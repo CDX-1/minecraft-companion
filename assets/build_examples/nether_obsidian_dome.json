@@ -1,0 +1,17 @@
+{
+  "id": "nether_obsidian_dome",
+  "name": "Obsidian Nether Dome",
+  "structureType": "dome",
+  "tags": ["nether", "dark", "obsidian", "ritual", "dome", "shrine", "ominous"],
+  "description": "A perfect hemisphere of obsidian with crying-obsidian veins, like a sealed ritual chamber surfacing from the bedrock. Dark and absorbs light — feels sacred and slightly threatening.",
+  "palette": {
+    "primary": "minecraft:obsidian",
+    "accent": "minecraft:crying_obsidian",
+    "glass": "minecraft:tinted_glass",
+    "decoration": ["minecraft:soul_lantern", "minecraft:respawn_anchor"]
+  },
+  "dimensions": { "width": 13, "depth": 13, "height": 7 },
+  "params": { "radius": 6 },
+  "source": "manual",
+  "notes": "Pure dome — radius 5-8 reads as shrine; radius 10+ becomes a sanctuary. Pair with soul_lantern for the eerie blue glow."
+}

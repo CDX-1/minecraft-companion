@@ -3,3 +3,4 @@ dist/
 .env
 *.js.map
 .minecraft-companion-memory.json
+.pybuild/

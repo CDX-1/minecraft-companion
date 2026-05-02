@@ -1,0 +1,17 @@
+{
+  "id": "brutalist_obelisk",
+  "name": "Brutalist Deepslate Obelisk",
+  "structureType": "obelisk",
+  "tags": ["brutalist", "modern", "monument", "deepslate", "imposing", "minimalist"],
+  "description": "A monolithic deepslate obelisk with a polished blackstone cap and base. Severe vertical lines, no ornamentation. Feels like a memorial or alien marker dropped into the landscape.",
+  "palette": {
+    "primary": "minecraft:deepslate",
+    "accent": "minecraft:polished_blackstone",
+    "glass": "minecraft:glass",
+    "decoration": []
+  },
+  "dimensions": { "width": 5, "depth": 5, "height": 24 },
+  "params": { "height": 24, "base": 3 },
+  "source": "manual",
+  "notes": "Tall and narrow — height should be roughly 8× base width. Polished blackstone for the foundation slab and tip cap."
+}

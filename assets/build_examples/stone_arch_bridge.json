@@ -1,0 +1,17 @@
+{
+  "id": "stone_arch_bridge",
+  "name": "Stone Arch Bridge",
+  "structureType": "bridge",
+  "tags": ["bridge", "stone", "medieval", "rustic", "infrastructure", "river-crossing"],
+  "description": "A wide cobblestone bridge with mossy stone-brick rails and lantern posts every few blocks. Functional and weathered — looks like it's been there for centuries.",
+  "palette": {
+    "primary": "minecraft:cobblestone",
+    "accent": "minecraft:mossy_stone_bricks",
+    "glass": "minecraft:glass",
+    "decoration": ["minecraft:lantern"]
+  },
+  "dimensions": { "width": 5, "depth": 24, "height": 4 },
+  "params": { "length": 24, "width": 3 },
+  "source": "manual",
+  "notes": "Length is the long axis; width is walking width. Mossy_stone_bricks accent gives it the aged feel."
+}
