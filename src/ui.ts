@@ -3,6 +3,8 @@ import mineflayer, { Bot } from 'mineflayer';
 import { pathfinder, Movements, goals } from 'mineflayer-pathfinder';
 import { parseChatCommand } from './commands';
 import { BotConfig } from './config';
+import { handleVoiceTranscript } from './voiceCommands';
+import { startVoiceServer, VoiceServer } from './voiceServer';
 
 export function launchUI(config: BotConfig): void {
   const screen = blessed.screen({
@@ -61,7 +63,12 @@ export function launchUI(config: BotConfig): void {
   screen.append(chatLog);
   screen.append(infoPanel);
 
-  screen.key(['C-c'], () => process.exit(0));
+  let voiceServer: VoiceServer | null = null;
+
+  screen.key(['C-c'], () => {
+    voiceServer?.close();
+    process.exit(0);
+  });
   screen.render();
 
   // ── Bot ───────────────────────────────────────────────────
@@ -86,6 +93,45 @@ export function launchUI(config: BotConfig): void {
 
     bot.pathfinder.setMovements(new Movements(bot));
     bot.pathfinder.setGoal(new goals.GoalFollow(target, FOLLOW_RANGE), true);
+  }
+
+  async function startVoiceCommands() {
+    if (!config.voiceEnabled) return;
+
+    try {
+      voiceServer = await startVoiceServer({
+        port: config.voicePort,
+        onTranscript: (text) => {
+          chatLog.log(`{magenta-fg}[voice]{/magenta-fg} ${text}`);
+
+          if (!bot?.entity) {
+            chatLog.log('{yellow-fg}[voice] Bot is not spawned yet; command ignored.{/yellow-fg}');
+            screen.render();
+            return;
+          }
+
+          const handled = handleVoiceTranscript(text, {
+            characterName: bot.username,
+            ownerUsername: config.ownerUsername,
+            sayHello: () => bot.chat('hello'),
+            follow: followPlayer,
+          });
+
+          if (!handled) {
+            chatLog.log('{yellow-fg}[voice] No matching command, or owner username is missing.{/yellow-fg}');
+          }
+
+          screen.render();
+        },
+      });
+
+      chatLog.log(`{magenta-fg}[voice] Open ${voiceServer.url} in Chrome or Edge and allow microphone access.{/magenta-fg}`);
+      screen.render();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      chatLog.log(`{red-fg}[voice] Failed to start voice server: ${message}{/red-fg}`);
+      screen.render();
+    }
   }
 
   function renderInfo() {
@@ -126,7 +172,7 @@ export function launchUI(config: BotConfig): void {
       chatLog.log(`{cyan-fg}<${username}>{/cyan-fg} ${message}`);
       screen.render();
 
-      const command = parseChatCommand(message);
+      const command = parseChatCommand(message, bot.username);
 
       if (command === 'greet') {
         bot.chat('hello');
@@ -146,6 +192,7 @@ export function launchUI(config: BotConfig): void {
 
     bot.on('end', (reason) => {
       if (infoTimer) clearInterval(infoTimer);
+      voiceServer?.close();
       chatLog.log(`{yellow-fg}[system] Disconnected: ${reason}{/yellow-fg}`);
       statusBar.setContent(`  Disconnected: ${reason}`);
       statusBar.style.bg = 'red';
@@ -153,5 +200,6 @@ export function launchUI(config: BotConfig): void {
     });
   }
 
+  void startVoiceCommands();
   connect();
 }

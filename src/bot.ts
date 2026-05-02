@@ -35,7 +35,7 @@ bot.on('chat', (username, message) => {
   if (username === bot.username) return;
   console.log(`[chat] <${username}> ${message}`);
 
-  const command = parseChatCommand(message);
+  const command = parseChatCommand(message, bot.username);
 
   if (command === 'greet') {
     bot.chat('hello');
