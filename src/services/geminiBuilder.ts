@@ -17,7 +17,26 @@ export interface GeneratedBuild {
   height: number;
   length: number;
   description: string;
+  /** Set on persisted builds; lets the caller key edits to a stored build. */
+  buildId?: string;
+  /** The Python script that produced this build, kept for future edit passes. */
+  script?: string;
 }
+
+export interface StoredBuildMeta {
+  id: string;
+  description: string;
+  origin: { x: number; y: number; z: number; rotation: 0 | 90 | 180 | 270 };
+  width: number;
+  height: number;
+  length: number;
+  createdAt: number;
+  updatedAt: number;
+  history: { prompt: string; ts: number; kind: 'create' | 'edit' }[];
+}
+
+const BUILDS_DIR = path.resolve(process.cwd(), '.minecraft-companion-builds');
+const BUILDS_INDEX = path.join(BUILDS_DIR, 'index.json');
 
 const SYSTEM_PYTHON = process.env.VENV_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
 
@@ -29,7 +48,15 @@ const VENV_PYTHON = process.platform === 'win32'
   ? path.join(VENV_DIR, 'Scripts', 'python.exe')
   : path.join(VENV_DIR, 'bin', 'python');
 
-const SYSTEM_INSTRUCTION = `Output a runnable Python script using \`mcschematic\` that builds the requested structure (min corner at 0,0,0) and saves it via .save(sys.argv[1], sys.argv[2], mcschematic.Version.JE_1_20_1). Python only, no markdown fences.`;
+const SYSTEM_INSTRUCTION = `Output a runnable Python script using the \`mcschematic\` library that builds the requested structure with min corner at (0,0,0). Python only, no markdown fences.
+
+EXACT mcschematic API — use these calls and ONLY these calls:
+  import sys, mcschematic
+  schem = mcschematic.MCSchematic()                       # create empty schematic
+  schem.setBlock((x, y, z), "minecraft:stone")            # place one block (tuple coord, namespaced id, optional [state])
+  schem.save(sys.argv[1], sys.argv[2], mcschematic.Version.JE_1_20_1)  # write <argv1>/<argv2>.schem
+
+Do NOT invent methods. There is no create_structure, no set_block, no Schematic(), no Version.JE_1_20_1.create_structure(). The constructor is mcschematic.MCSchematic() with no args. The block setter is .setBlock((x,y,z), id) — camelCase, tuple coord.`;
 
 const FLASH_MODEL = process.env.GEMINI_FLASH_MODEL || 'gemini-3-flash-preview';
 const PRO_MODEL = process.env.GEMINI_PRO_MODEL || process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
@@ -264,6 +291,70 @@ function unwrap(node: NbtNode | undefined): unknown {
   return (node as { value: unknown }).value;
 }
 
+async function ensureBuildsDir(): Promise<void> {
+  await fs.mkdir(BUILDS_DIR, { recursive: true });
+}
+
+async function readIndex(): Promise<StoredBuildMeta[]> {
+  try {
+    const raw = await fs.readFile(BUILDS_INDEX, 'utf8');
+    const arr = JSON.parse(raw) as StoredBuildMeta[];
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeIndex(entries: StoredBuildMeta[]): Promise<void> {
+  await ensureBuildsDir();
+  await fs.writeFile(BUILDS_INDEX, JSON.stringify(entries, null, 2), 'utf8');
+}
+
+export async function listStoredBuilds(): Promise<StoredBuildMeta[]> {
+  return readIndex();
+}
+
+/** Returns the build whose bbox center is closest to the given position, or null if none exist. */
+export async function findNearestBuild(
+  pos: { x: number; y: number; z: number },
+): Promise<StoredBuildMeta | null> {
+  const all = await readIndex();
+  let best: StoredBuildMeta | null = null;
+  let bestDist = Infinity;
+  for (const b of all) {
+    const cx = b.origin.x;
+    const cy = b.origin.y + b.height / 2;
+    const cz = b.origin.z;
+    const d = (cx - pos.x) ** 2 + (cy - pos.y) ** 2 + (cz - pos.z) ** 2;
+    if (d < bestDist) { bestDist = d; best = b; }
+  }
+  return best;
+}
+
+export async function loadBuildScript(buildId: string): Promise<string | null> {
+  try {
+    return await fs.readFile(path.join(BUILDS_DIR, buildId, 'latest.py'), 'utf8');
+  } catch { return null; }
+}
+
+async function persistBuild(
+  meta: StoredBuildMeta,
+  script: string,
+  schemSourcePath: string,
+): Promise<void> {
+  await ensureBuildsDir();
+  const dir = path.join(BUILDS_DIR, meta.id);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, 'latest.py'), script, 'utf8');
+  await fs.copyFile(schemSourcePath, path.join(dir, 'latest.schem'));
+  await fs.writeFile(path.join(dir, 'meta.json'), JSON.stringify(meta, null, 2), 'utf8');
+
+  const idx = await readIndex();
+  const existing = idx.findIndex(e => e.id === meta.id);
+  if (existing >= 0) idx[existing] = meta; else idx.push(meta);
+  await writeIndex(idx);
+}
+
 export interface BuildPassEvent {
   pass: number;
   totalPasses: number;
@@ -276,6 +367,7 @@ export async function buildFromPrompt(
   userPrompt: string,
   log: (msg: string) => void,
   onPass?: (event: BuildPassEvent) => Promise<void> | void,
+  persistAt?: { origin: { x: number; y: number; z: number; rotation: 0 | 90 | 180 | 270 } },
 ): Promise<GeneratedBuild> {
   await ensureMcschematic(log);
 
@@ -288,6 +380,8 @@ export async function buildFromPrompt(
   const turns: GeminiTurn[] = [];
   let script = '';
   let finalBuild: GeneratedBuild | null = null;
+  let finalScript = '';
+  let finalSchemPath = '';
   const totalPasses = PASS_PROMPTS.length;
 
   for (let pass = 0; pass < totalPasses; pass++) {
@@ -357,7 +451,11 @@ export async function buildFromPrompt(
     }
 
     if (build) {
-      if (isFinal) finalBuild = build;
+      if (isFinal) {
+        finalBuild = build;
+        finalScript = script;
+        finalSchemPath = schemPath;
+      }
       if (onPass) {
         try { await onPass({ pass, totalPasses, label, build, isFinal }); }
         catch (err) { log(`[gemini-build] onPass handler threw: ${(err as Error).message}`); }
@@ -367,8 +465,128 @@ export async function buildFromPrompt(
 
   if (!finalBuild) throw new Error('All build passes failed');
 
+  finalBuild.script = finalScript;
+
+  if (persistAt) {
+    const id = `b_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+    const meta: StoredBuildMeta = {
+      id,
+      description: finalBuild.description,
+      origin: persistAt.origin,
+      width: finalBuild.width,
+      height: finalBuild.height,
+      length: finalBuild.length,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      history: [{ prompt: userPrompt, ts: Date.now(), kind: 'create' }],
+    };
+    try {
+      await persistBuild(meta, finalScript, finalSchemPath);
+      finalBuild.buildId = id;
+      log(`[gemini-build] persisted as ${id}`);
+    } catch (err) {
+      log(`[gemini-build] persist failed (non-fatal): ${(err as Error).message}`);
+    }
+  }
+
   // best-effort cleanup
   fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
 
   return finalBuild;
+}
+
+const EDIT_INSTRUCTION = [
+  'EDIT PASS — modify the EXISTING build script below.',
+  '',
+  'HARD RULES:',
+  '1. The previous script defines the existing structure. Preserve every block NOT implicated by the user\'s edit.',
+  '2. Apply ONLY what the user asked for. Do not redesign, re-theme, or "improve" unrelated areas.',
+  '3. Keep the same coordinate system: min corner at (0,0,0). Do not translate the build.',
+  '4. If the edit adds something (e.g. "add a balcony"), extend the existing geometry — don\'t replace it.',
+  '5. If the edit removes/swaps something, only touch the specific blocks implicated.',
+  '',
+  'OUTPUT: the COMPLETE updated Python script (self-contained, re-places the full build with the edit applied). Python only, no markdown fences, do not truncate.',
+].join('\n');
+
+/**
+ * Edit a previously persisted build. Generates a new script via Gemini using
+ * the prior script as context, runs it, parses the resulting .schem, and
+ * updates the stored build in place.
+ */
+export async function editFromPrompt(
+  buildId: string,
+  editPrompt: string,
+  log: (msg: string) => void,
+  onResult?: (event: BuildPassEvent) => Promise<void> | void,
+): Promise<GeneratedBuild> {
+  await ensureMcschematic(log);
+
+  const prevScript = await loadBuildScript(buildId);
+  if (!prevScript) throw new Error(`No stored script for build ${buildId}`);
+  const idx = await readIndex();
+  const prevMeta = idx.find(e => e.id === buildId);
+  if (!prevMeta) throw new Error(`No stored meta for build ${buildId}`);
+
+  log(`[gemini-edit] editing ${buildId}: "${editPrompt}"`);
+
+  const turns: GeminiTurn[] = [
+    { role: 'user', text: `Original build description: ${prevMeta.description}\n\nHere is the current build script:` },
+    { role: 'model', text: prevScript },
+    { role: 'user', text: `${EDIT_INSTRUCTION}\n\nUser edit: ${editPrompt}` },
+  ];
+
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mc-edit-'));
+  const schemName = 'out';
+  const scriptPath = path.join(tmpDir, 'build.py');
+  const schemPath = path.join(tmpDir, `${schemName}.schem`);
+
+  let script = await callGemini(turns, { model: PRO_MODEL, thinkingBudget: 2048 });
+
+  const MAX_FIX_ATTEMPTS = 2;
+  for (let attempt = 0; attempt <= MAX_FIX_ATTEMPTS; attempt++) {
+    await fs.writeFile(scriptPath, script, 'utf8');
+    const check = await runChild(VENV_PYTHON, ['-m', 'py_compile', scriptPath], log);
+    if (check.code === 0) break;
+    if (attempt === MAX_FIX_ATTEMPTS) {
+      throw new Error(`Edit script has syntax errors after ${MAX_FIX_ATTEMPTS} fix attempts: ${check.stderr.slice(0, 400)}`);
+    }
+    log(`[gemini-edit] syntax error, asking Gemini to fix (attempt ${attempt + 1})...`);
+    turns.push({ role: 'model', text: script });
+    turns.push({ role: 'user', text: `Your script has a Python syntax error. Fix it and output the COMPLETE corrected script (no markdown fences, Python only). Make sure the script is not truncated.\n\nError:\n${check.stderr.slice(0, 800)}` });
+    script = await callGemini(turns, { model: PRO_MODEL, thinkingBudget: 2048 });
+  }
+
+  const run = await runChild(VENV_PYTHON, [scriptPath, tmpDir, schemName], log);
+  if (run.code !== 0) throw new Error(`Edit script failed (exit ${run.code}): ${run.stderr.slice(0, 400)}`);
+  try { await fs.access(schemPath); } catch { throw new Error(`Edit script ran but no .schem produced at ${schemPath}`); }
+
+  const build = await parseSchem(schemPath);
+  build.description = prevMeta.description;
+  build.script = script;
+  build.buildId = buildId;
+  log(`[gemini-edit] parsed: ${build.blocks.length} blocks, ${build.width}×${build.height}×${build.length}`);
+
+  const updatedMeta: StoredBuildMeta = {
+    ...prevMeta,
+    width: build.width,
+    height: build.height,
+    length: build.length,
+    updatedAt: Date.now(),
+    history: [...prevMeta.history, { prompt: editPrompt, ts: Date.now(), kind: 'edit' }],
+  };
+  try {
+    await persistBuild(updatedMeta, script, schemPath);
+    log(`[gemini-edit] updated stored build ${buildId}`);
+  } catch (err) {
+    log(`[gemini-edit] persist failed (non-fatal): ${(err as Error).message}`);
+  }
+
+  if (onResult) {
+    try { await onResult({ pass: 0, totalPasses: 1, label: 'edit', build, isFinal: true }); }
+    catch (err) { log(`[gemini-edit] onResult handler threw: ${(err as Error).message}`); }
+  }
+
+  fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+
+  return build;
 }

@@ -14,6 +14,14 @@ test('ignores configured bot usernames case-insensitively', () => {
   assert.equal(shouldIgnoreChatSender('HelperBot', 'companion', ['helperbot']), true);
 });
 
+test('ignores every other player when an owner username is configured', () => {
+  assert.equal(shouldIgnoreChatSender('Alex', 'companion', [], 'Steve'), true);
+});
+
+test('allows only the configured owner when owner filtering is enabled', () => {
+  assert.equal(shouldIgnoreChatSender('Steve', 'companion', ['helperbot'], 'Steve'), false);
+});
+
 test('does not ignore regular players', () => {
   assert.equal(shouldIgnoreChatSender('Steve', 'companion', ['helperbot']), false);
 });

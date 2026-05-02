@@ -7,12 +7,16 @@ import { Vec3 } from 'vec3';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
 import { BuildSession, BuildStatus, rotateBlockState } from './services/builder';
 import { BuilderCrewSession } from './services/builderCrew';
-import { buildFromPrompt, GeneratedBuild } from './services/geminiBuilder';
+import { buildFromPrompt, editFromPrompt, findNearestBuild, listStoredBuilds, GeneratedBuild } from './services/geminiBuilder';
 import { MemoryManager } from './agent/MemoryManager';
 import { StateMachine } from './agent/StateMachine';
 
 function looksLikeBuildIntent(message: string): boolean {
   return /\b(build|construct|erect|put up|create me|design me|make me a|spawn me a|tower|house|castle|villa|mansion|dome|sphere|pyramid|wall|bridge|arch|cube|staircase|obelisk|fountain|temple|shrine|cathedral|church|cottage|dock|pier|statue|monument|sakura|cherry blossom|dragon|death star)\b/i.test(message);
+}
+
+function looksLikeEditIntent(message: string): boolean {
+  return /\b(make it|change it|modify|edit|tweak|adjust|refine|update it|turn (this|that|it) into|add (a|an|some|more)|remove (the|a|some)|swap|replace (the|its)|taller|shorter|wider|narrower|bigger|smaller|larger|expand|shrink|more (windows|doors|detail|trim)|fewer)\b/i.test(message);
 }
 
 const BUILD_VOICELINES: Record<Personality, {
@@ -1331,6 +1335,24 @@ export class MinecraftAgent {
     this.isThinking = true;
     try {
       this.currentSender = sender;
+      if (looksLikeEditIntent(message)) {
+        const playerEntity = this.bot.players[sender]?.entity;
+        const refPos = playerEntity?.position ?? this.bot.entity?.position;
+        if (refPos) {
+          const nearest = await findNearestBuild({ x: refPos.x, y: refPos.y, z: refPos.z });
+          if (nearest) {
+            this.currentSender = sender;
+            const lines = BUILD_VOICELINES[this.personality];
+            void this.runGeminiEdit(nearest.id, message).catch(err => {
+              const msg = err instanceof Error ? err.message : String(err);
+              this.log(`[gemini-edit] failed: ${msg}`);
+              this.onAutonomousMessage?.(pickLine(lines.fail));
+            });
+            return pickLine(lines.ack);
+          }
+        }
+      }
+
       if (looksLikeBuildIntent(message)) {
         this.currentSender = sender;
         const lines = BUILD_VOICELINES[this.personality];
@@ -2192,9 +2214,14 @@ export class MinecraftAgent {
         });
     };
 
-    const generated = await buildFromPrompt(message, this.log, async ({ pass, totalPasses, label, build, isFinal }) => {
-      startReplay(build, `pass ${pass + 1}/${totalPasses} (${label})`, isFinal);
-    });
+    const generated = await buildFromPrompt(
+      message,
+      this.log,
+      async ({ pass, totalPasses, label, build, isFinal }) => {
+        startReplay(build, `pass ${pass + 1}/${totalPasses} (${label})`, isFinal);
+      },
+      { origin: { x: origin.x, y: origin.y, z: origin.z, rotation: rot as 0 | 90 | 180 | 270 } },
+    );
     if (!generated.blocks.length) {
       this.onAutonomousMessage?.(pickLine(lines.fail));
       return '';
@@ -2203,6 +2230,59 @@ export class MinecraftAgent {
     // Wait for whichever replay is currently running to finish (final pass was
     // kicked off inside the onPass callback above).
     if (lastReplay) await lastReplay;
+    const status = this.builder.getStatus();
+    if (status.phase === 'error') {
+      this.onAutonomousMessage?.(pickLine(lines.fail));
+      return '';
+    }
+    if (status.phase === 'cancelled') {
+      this.onAutonomousMessage?.(pickLine(lines.cancelled));
+      return '';
+    }
+    this.onAutonomousMessage?.(pickLine(lines.done));
+    return '';
+  }
+
+  private async runGeminiEdit(buildId: string, message: string): Promise<string> {
+    const lines = BUILD_VOICELINES[this.personality];
+    this.log(`[gemini-edit] editing ${buildId}: "${message}"`);
+
+    const generated = await editFromPrompt(buildId, message, this.log);
+    if (!generated.blocks.length) {
+      this.onAutonomousMessage?.(pickLine(lines.fail));
+      return '';
+    }
+
+    // Re-anchor at the build's stored origin (NOT the player) so the edit
+    // overwrites the same structure in place. applyTransition will diff
+    // against whatever is currently rendered and only touch changed blocks.
+    const meta = (await listStoredBuilds()).find(b => b.id === buildId);
+    if (!meta) throw new Error(`Stored meta vanished for build ${buildId}`);
+
+    const origin = { x: meta.origin.x, y: meta.origin.y, z: meta.origin.z, rotation: meta.origin.rotation };
+    const rot = origin.rotation;
+    const cx = Math.floor(generated.width / 2);
+    const cz = Math.floor(generated.length / 2);
+    const blocks = generated.blocks.map(blk => {
+      const lx = blk.x - cx;
+      const lz = blk.z - cz;
+      let rx = lx, rz = lz;
+      if (rot === 90)  { rx = -lz; rz =  lx; }
+      else if (rot === 180) { rx = -lx; rz = -lz; }
+      else if (rot === 270) { rx =  lz; rz = -lx; }
+      return {
+        x: origin.x + rx,
+        y: origin.y + blk.y,
+        z: origin.z + rz,
+        block: rotateBlockState(blk.block, rot),
+      };
+    });
+
+    this.builder.cancelBuild();
+    await this.builder.awaitIdle();
+    const desc = `${generated.description} (edited: ${message.slice(0, 40)})`;
+    await this.builder.replay(blocks, desc, origin, (s) => this.onBuildStatus?.(s));
+
     const status = this.builder.getStatus();
     if (status.phase === 'error') {
       this.onAutonomousMessage?.(pickLine(lines.fail));
