@@ -139,7 +139,6 @@ export function launchUI(config: BotConfig): void {
     screen.render();
   }
 
-  function logWarning(message: string) {
     chatLog.log(`{yellow-fg}[warn]{/yellow-fg} ${message}`);
     screen.render();
   }
@@ -166,10 +165,6 @@ export function launchUI(config: BotConfig): void {
   moodTracker = createMoodTracker({
     log: logSystem,
     onScoreChange: (score) => ledStatus?.setMood(score),
-  });
-
-  ledStatus.setStatus('yellow', 'companion starting');
-
   function loadPluginSafely(name: string, plugin: Parameters<Bot['loadPlugin']>[0]) {
     try {
       bot.loadPlugin(plugin);
