@@ -6,7 +6,6 @@ import { Movements, goals } from 'mineflayer-pathfinder';
 import { Vec3 } from 'vec3';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
 import { BuildSession, BuildStatus, PlacedBuild, rotateBlockState } from './services/builder';
-import { BuilderCrewSession } from './services/builderCrew';
 import { buildFromPrompt, editFromPrompt, findNearestBuild, listStoredBuilds, GeneratedBuild } from './services/geminiBuilder';
 import { MemoryManager } from './agent/MemoryManager';
 import { StateMachine } from './agent/StateMachine';
@@ -58,41 +57,19 @@ function pickLine(lines: string[]): string {
 }
 
 /**
- * Throttled progress-line dispatcher. Fires `start` once on first non-zero
- * progress, then `mid`/`detail` every MIN_GAP_MS (independent of how many
- * tiny passes the build flickers through) — prevents the "three lines in a
- * row at the start, then silence" failure mode where many BuildStatus
- * resets each cross 25/50/75% in quick succession.
+ * Fires a single `start` line on first non-zero progress and then stays
+ * quiet. Mid/detail/percent quips were dropped — overlapping voice during
+ * placement made the bot feel like it was talking instead of building.
+ * Done/cancelled/fail are still spoken at terminal points by the caller.
  */
 function makeBuildLineSpeaker(
-  fire: (moment: 'start' | 'mid' | 'detail', placed: number, total: number) => void,
-  opts: { minGapMs?: number } = {},
+  fire: (moment: 'start', placed: number, total: number) => void,
 ) {
-  const minGap = opts.minGapMs ?? 8000;
   let started = false;
-  let lastAt = 0;
-  let detailFired = false;
   return (placed: number, total: number): void => {
-    if (placed <= 0) return;
-    const now = Date.now();
-    if (!started) {
-      started = true;
-      lastAt = now;
-      fire('start', placed, total);
-      return;
-    }
-    if (now - lastAt < minGap) return;
-    if (total > 0) {
-      const frac = placed / total;
-      if (frac >= 0.75 && !detailFired) {
-        detailFired = true;
-        lastAt = now;
-        fire('detail', placed, total);
-        return;
-      }
-    }
-    lastAt = now;
-    fire('mid', placed, total);
+    if (placed <= 0 || started) return;
+    started = true;
+    fire('start', placed, total);
   };
 }
 
@@ -1207,32 +1184,7 @@ export class MinecraftAgent {
       this.openai = new OpenAI({ apiKey: this.apiKey });
     }
 
-    const buildCrew = resolvedOptions.buildCrew?.enabled
-      ? new BuilderCrewSession({
-          host: resolvedOptions.buildCrew.host,
-          port: resolvedOptions.buildCrew.port,
-          auth: resolvedOptions.buildCrew.auth,
-          mainUsername: resolvedOptions.buildCrew.mainUsername,
-          crewSize: resolvedOptions.buildCrew.size,
-          version: bot.version,
-          frameDelayMs: 100,
-          commandBot: bot,
-          log,
-        })
-      : null;
-
-    this.builder = new BuildSession(bot, log, buildCrew ? {
-      flyAlong: false,
-      executor: async (ops, onPlaced, context) => {
-        try {
-          await buildCrew.run(ops, status => onPlaced(status.placed), context.origin);
-          return true;
-        } catch (err) {
-          log(`[build-crew] failed, falling back to solo builder: ${err instanceof Error ? err.message : String(err)}`);
-          return false;
-        }
-      },
-    } : {});
+    this.builder = new BuildSession(bot, log, {});
     this.onBuildStatus = onBuildStatus;
 
     this.memoryManager = new MemoryManager(this.log.bind(this));
@@ -2301,27 +2253,27 @@ Reply with ONE short, in-character line (under 100 chars) that reacts to THIS sp
     );
 
     let finalArrived = false;
-    // ~12 blocks/sec base, stretching up to ~2 blocks/sec if the final pass
-    // is slow and we're nearing the end of the massing render.
-    const BASE_DELAY_MS = 80;
+    // Base delay is set by BuildSession itself based on op count (size-scaled
+    // pacing). We layer a "stretch toward 2 blocks/sec" ramp on top: if the
+    // final design hasn't arrived and we're past 70% of the massing pass,
+    // slow down quadratically so we don't finish and stand idle waiting.
     const MAX_DELAY_MS = 500;
+    let baseDelayMs: number | null = null;
     const onReplayProgress = (s: BuildStatus): void => {
       this.onBuildStatus?.(s);
       if (s.phase !== 'building') return;
       speakWithGap(s.placed, s.total);
-      // If the final design hasn't arrived and we're past 70% of massing,
-      // stretch the delay so we don't finish and stand idle. Quadratic ramp
-      // from BASE at 70% to MAX at 100%.
+      if (baseDelayMs === null) baseDelayMs = this.builder.getFrameDelay();
       if (!finalArrived && s.total > 0) {
         const frac = s.placed / s.total;
         if (frac > 0.7) {
           const t = Math.min(1, (frac - 0.7) / 0.3);
-          const delay = BASE_DELAY_MS + (MAX_DELAY_MS - BASE_DELAY_MS) * t * t;
+          const delay = baseDelayMs + (MAX_DELAY_MS - baseDelayMs) * t * t;
           this.builder.setFrameDelay(delay);
+          return;
         }
-      } else {
-        this.builder.setFrameDelay(BASE_DELAY_MS);
       }
+      this.builder.setFrameDelay(baseDelayMs);
     };
 
     let lastReplay: Promise<{ build: PlacedBuild } | undefined> | null = null;
@@ -2335,9 +2287,10 @@ Reply with ONE short, in-character line (under 100 chars) that reacts to THIS sp
       this.log(`[gemini-build] rendering ${label} — ${blocks.length} blocks${isFinal ? ' (final)' : ''}`);
       if (isFinal) finalArrived = true;
       // Cancel any in-flight render; applyTransition will diff from whatever
-      // got placed so far into the new target.
+      // got placed so far into the new target. The next replay sets its own
+      // size-scaled base delay, so no manual reset is needed here.
       this.builder.cancelBuild();
-      this.builder.setFrameDelay(BASE_DELAY_MS);
+      baseDelayMs = null;
       lastReplay = this.builder.awaitIdle()
         .then(() => this.builder.replayFresh(blocks, desc, origin, onReplayProgress))
         .catch(err => {

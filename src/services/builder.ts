@@ -133,6 +133,10 @@ export class BuildSession {
   setFrameDelay(ms: number): void {
     this.activeFrameDelayMs = Math.max(0, ms);
   }
+  /** Current per-frame delay in ms — reflects the size-scaled base set per build. */
+  getFrameDelay(): number {
+    return this.activeFrameDelayMs;
+  }
 
   defaultOrigin(player?: PlayerContext): Origin {
     const p = player?.position ?? this.bot.entity?.position;
@@ -377,7 +381,13 @@ export class BuildSession {
       return this.getStatus();
     }
 
-    this.activeFrameDelayMs = this.opts.frameDelayMs;
+    // Size-proportional pacing: anchor at 250 blocks → 12 blocks/sec, scale
+    // with blocks^0.6 so larger builds finish faster per-block but smaller
+    // ones stay watchable. Clamped to [4, 60] blocks/sec.
+    const opCount = ops.length;
+    const rawBps = 12 * Math.pow(Math.max(1, opCount) / 250, 0.6);
+    const bps = Math.max(4, Math.min(60, rawBps));
+    this.activeFrameDelayMs = Math.round(1000 / bps);
     const run = (async (): Promise<BuildStatus> => {
       try {
         const { blocksPerFrame } = this.opts;
@@ -399,31 +409,77 @@ export class BuildSession {
           }
         }
 
-        const hoverY = (next?.bounds?.max.y ?? old?.bounds?.max.y ?? 64) + 4;
-        let executed = 0;
-        for (let i = 0; i < ops.length; i += blocksPerFrame) {
-          if (this.buildAbort) {
-            this.current = partialAfter(old, ops, executed, next);
-            this.status.phase = 'cancelled';
-            this.status.message = `Cancelled at ${executed}/${ops.length}`;
+        const bounds = next?.bounds ?? old?.bounds;
+        const hoverY = (bounds?.max.y ?? 64) + 3;
+        // Perimeter orbit: bot circles around the build's centroid at a
+        // standoff distance, biased toward the block currently being placed
+        // so it always feels "near" the work.
+        const cx = bounds ? (bounds.min.x + bounds.max.x) / 2 : 0;
+        const cz = bounds ? (bounds.min.z + bounds.max.z) / 2 : 0;
+        const halfX = bounds ? (bounds.max.x - bounds.min.x) / 2 : 0;
+        const halfZ = bounds ? (bounds.max.z - bounds.min.z) / 2 : 0;
+        const orbitRadius = Math.max(5, Math.hypot(halfX, halfZ) + 5);
+
+        // Stop pathfinder + drop into creative w/ flying so the bot doesn't
+        // fight gravity or goal-following while we teleport it around the
+        // build. Spectator would hide the avatar from other players, which
+        // defeats the whole "watch the AI build" effect.
+        const priorMode = (this.bot.game as { gameMode?: string } | undefined)?.gameMode;
+        let restoredMode = false;
+        const restoreMode = (): void => {
+          if (restoredMode) return;
+          restoredMode = true;
+          if (priorMode && priorMode !== 'creative') {
+            this.bot.chat(`/gamemode ${priorMode} ${this.bot.username}`);
+          }
+        };
+        try {
+          const pf = (this.bot as unknown as { pathfinder?: { setGoal: (g: unknown) => void; stop?: () => void } }).pathfinder;
+          if (pf) {
+            try { pf.setGoal(null); } catch { /* ignore */ }
+            try { pf.stop?.(); } catch { /* ignore */ }
+          }
+          if (priorMode && priorMode !== 'creative') {
+            this.bot.chat(`/gamemode creative ${this.bot.username}`);
+            await wait(80);
+          }
+          // Tell the server we're flying. In creative the abilities packet
+          // flags bit 0x02 = isFlying. Without this, gravity still applies
+          // between teleports and the avatar visibly drops each frame.
+          try {
+            const client = (this.bot as unknown as { _client?: { write: (n: string, p: unknown) => void } })._client;
+            client?.write('abilities', { flags: 0x02, flyingSpeed: 0.05, walkingSpeed: 0.1 });
+          } catch { /* ignore — server will tolerate gravity if this fails */ }
+
+          let executed = 0;
+          for (let i = 0; i < ops.length; i += blocksPerFrame) {
+            if (this.buildAbort) {
+              this.current = partialAfter(old, ops, executed, next);
+              this.status.phase = 'cancelled';
+              this.status.message = `Cancelled at ${executed}/${ops.length}`;
+              onProgress?.(this.getStatus());
+              restoreMode();
+              return this.getStatus();
+            }
+            const end = Math.min(i + blocksPerFrame, ops.length);
+            const frame = ops.slice(i, end);
+            this.flyToFrame(frame, hoverY, cx, cz, orbitRadius, i, ops.length);
+            for (const op of frame) {
+              this.bot.chat(`/setblock ${op.x} ${op.y} ${op.z} ${op.block}`);
+            }
+            executed = end;
+            this.status.placed = end;
             onProgress?.(this.getStatus());
-            return this.getStatus();
+            if (this.activeFrameDelayMs > 0 && end < ops.length) await wait(this.activeFrameDelayMs);
           }
-          const end = Math.min(i + blocksPerFrame, ops.length);
-          const frame = ops.slice(i, end);
-          this.flyToFrame(frame, hoverY);
-          for (const op of frame) {
-            this.bot.chat(`/setblock ${op.x} ${op.y} ${op.z} ${op.block}`);
-          }
-          executed = end;
-          this.status.placed = end;
+          this.status.phase = 'done';
+          this.status.message = next ? `Built ${next.description}` : 'Demolished';
           onProgress?.(this.getStatus());
-          if (this.activeFrameDelayMs > 0 && end < ops.length) await wait(this.activeFrameDelayMs);
+          restoreMode();
+          return this.getStatus();
+        } finally {
+          restoreMode();
         }
-        this.status.phase = 'done';
-        this.status.message = next ? `Built ${next.description}` : 'Demolished';
-        onProgress?.(this.getStatus());
-        return this.getStatus();
       } catch (err) {
         this.status.phase = 'error';
         this.status.message = err instanceof Error ? err.message : String(err);
@@ -478,14 +534,46 @@ export class BuildSession {
     return { ...bp, blocks: [...map.values()] };
   }
 
-  private flyToFrame(frame: BlockPlacement[], hoverY: number): void {
+  private flyToFrame(
+    frame: BlockPlacement[],
+    _hoverY: number,
+    centerX: number,
+    centerZ: number,
+    _orbitRadius: number,
+    _opIndex: number,
+    _opTotal: number,
+  ): void {
+    void _hoverY; void _orbitRadius; void _opIndex; void _opTotal;
     if (!this.opts.flyAlong || !frame.length) return;
-    let sx = 0, sz = 0;
-    for (const b of frame) { sx += b.x; sz += b.z; }
-    const cx = sx / frame.length;
-    const cz = sz / frame.length;
-    const yaw = Math.atan2(-(cx - (this.bot.entity?.position.x ?? cx)), -(cz - (this.bot.entity?.position.z ?? cz))) * 180 / Math.PI;
-    this.bot.chat(`/tp @s ${cx.toFixed(2)} ${hoverY} ${cz.toFixed(2)} ${yaw.toFixed(0)} 60`);
+    // Stand right next to the block we're about to place: pick the side
+    // facing the build's interior so the avatar visibly leans onto its work
+    // instead of hovering on the far perimeter.
+    const op = frame[0];
+    const fx = op.x + 0.5;
+    const fy = op.y;
+    const fz = op.z + 0.5;
+    let dx = fx - centerX;
+    let dz = fz - centerZ;
+    const len = Math.hypot(dx, dz);
+    if (len < 0.001) { dx = 1; dz = 0; }
+    else { dx /= len; dz /= len; }
+    // Bot stands ~1.6 blocks outward from the placed block, eye-level above it.
+    const standoff = 1.6;
+    const px = fx + dx * standoff;
+    const py = fy + 1.2;
+    const pz = fz + dz * standoff;
+    // Face the block being placed.
+    const yawDeg = Math.atan2(-(fx - px), (fz - pz)) * 180 / Math.PI;
+    // Pitch down slightly toward the block (positive pitch = looking down).
+    const horiz = Math.hypot(fx - px, fz - pz) || 1;
+    const pitchDeg = Math.atan2(py - (fy + 0.5), horiz) * 180 / Math.PI;
+    this.bot.chat(`/tp @s ${px.toFixed(2)} ${py.toFixed(2)} ${pz.toFixed(2)} ${yawDeg.toFixed(0)} ${pitchDeg.toFixed(0)}`);
+    const ent = this.bot.entity;
+    if (ent?.position) {
+      ent.position.x = px;
+      ent.position.y = py;
+      ent.position.z = pz;
+    }
   }
 }
 
