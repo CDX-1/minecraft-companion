@@ -14,6 +14,8 @@ export interface Origin {
   x: number;
   y: number;
   z: number;
+  /** Cardinal rotation (0/90/180/270 deg, CCW around Y) applied to the schem's local axes. */
+  rotation?: 0 | 90 | 180 | 270;
 }
 
 export interface Bounds {
@@ -89,18 +91,21 @@ export class BuildSession {
     this.activeFrameDelayMs = Math.max(0, ms);
   }
 
-  defaultOrigin(player?: PlayerContext): Origin {
-    const p = player?.position ?? this.bot.entity?.position;
-    const yaw = player?.yaw ?? this.bot.entity?.yaw ?? 0;
-    if (!p) return { x: 0, y: 64, z: 0 };
+  defaultOrigin(_player?: PlayerContext): Origin {
+    // Anchor at the BOT, not the player: project 8 blocks in front of the bot
+    // along its own yaw, then snap Y to the terrain surface so the build sits
+    // on the ground rather than floating at the bot's eye level.
+    const p = this.bot.entity?.position;
+    const yaw = this.bot.entity?.yaw ?? 0;
+    if (!p) return { x: 0, y: 64, z: 0, rotation: 0 };
     const dx = -Math.sin(yaw) * 8;
     const dz = -Math.cos(yaw) * 8;
-    let originX = Math.round(p.x + dx);
-    let originZ = Math.round(p.z + dz);
+    const originX = Math.round(p.x + dx);
+    const originZ = Math.round(p.z + dz);
     let originY = Math.round(p.y);
     const surface = this.surfaceY(originX, originZ, originY);
     if (surface !== null) originY = surface + 1;
-    return { x: originX, y: originY, z: originZ };
+    return { x: originX, y: originY, z: originZ, rotation: yawToRotation(yaw) };
   }
 
   private surfaceY(x: number, z: number, startY: number): number | null {
@@ -340,6 +345,73 @@ export class BuildSession {
     const yaw = Math.atan2(-(cx - (this.bot.entity?.position.x ?? cx)), -(cz - (this.bot.entity?.position.z ?? cz))) * 180 / Math.PI;
     this.bot.chat(`/tp @s ${cx.toFixed(2)} ${hoverY} ${cz.toFixed(2)} ${yaw.toFixed(0)} 60`);
   }
+}
+
+/**
+ * Snap a yaw (radians) to the nearest cardinal rotation (CCW around Y) so the
+ * schem's local +Z ("front") points back toward the bot. Bot yaw=0 looks south
+ * (+Z), so the origin sits at -Z relative to the bot — to make the schem's
+ * +Z face the bot, the schem must be rotated 180°. Each 90° of bot yaw
+ * subtracts 90° from that.
+ */
+function yawToRotation(yaw: number): 0 | 90 | 180 | 270 {
+  const deg = ((yaw * 180 / Math.PI) % 360 + 360) % 360;
+  const quad = Math.round(deg / 90) % 4;
+  return ([180, 90, 0, 270] as const)[quad];
+}
+
+// CCW around +Y, matching the (x,z)→(-z,x) coord transform in agent.ts.
+// One step of +90° maps a unit vector east(+X) → south(+Z), so cardinal
+// facings cycle N → E → S → W → N per +90°.
+const FACING_CYCLE = ['north', 'east', 'south', 'west'] as const;
+const AXIS_SWAP: Record<string, string> = { x: 'z', z: 'x' };
+
+/**
+ * Rewrite a block string's directional state properties to match a CCW
+ * rotation of `rot` degrees (0/90/180/270) around the Y axis.
+ *
+ * Handles: facing= (cardinal only — up/down untouched), axis= (x↔z when
+ * rotation is odd quarter-turn), rotation= (0..15, each unit = 22.5°).
+ *
+ * Why: schem palette strings bake facings (e.g. oak_stairs[facing=north]).
+ * If we rotate the build's coordinates without rewriting these, stairs and
+ * doors point the wrong way.
+ */
+export function rotateBlockState(blockId: string, rot: 0 | 90 | 180 | 270): string {
+  if (rot === 0) return blockId;
+  const open = blockId.indexOf('[');
+  if (open === -1) return blockId;
+  const close = blockId.lastIndexOf(']');
+  if (close === -1) return blockId;
+  const head = blockId.slice(0, open);
+  const inside = blockId.slice(open + 1, close);
+  const steps = (rot / 90) | 0;
+
+  const parts = inside.split(',').map(seg => {
+    const eq = seg.indexOf('=');
+    if (eq === -1) return seg;
+    const key = seg.slice(0, eq).trim();
+    const val = seg.slice(eq + 1).trim();
+    if (key === 'facing') {
+      const idx = FACING_CYCLE.indexOf(val as typeof FACING_CYCLE[number]);
+      if (idx === -1) return seg; // up/down or unknown — leave alone
+      return `${key}=${FACING_CYCLE[(idx + steps) % 4]}`;
+    }
+    if (key === 'axis' && (rot === 90 || rot === 270)) {
+      const swapped = AXIS_SWAP[val];
+      return swapped ? `${key}=${swapped}` : seg;
+    }
+    if (key === 'rotation') {
+      const n = Number(val);
+      if (!Number.isFinite(n)) return seg;
+      // 16-step rotation: each cardinal step (90°) = 4 units.
+      const next = (((n + steps * 4) % 16) + 16) % 16;
+      return `${key}=${next}`;
+    }
+    return seg;
+  });
+
+  return `${head}[${parts.join(',')}]`;
 }
 
 function emptyStatus(): BuildStatus {

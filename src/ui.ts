@@ -8,6 +8,7 @@ import { MinecraftAgent } from './agent';
 import { classifyDamageMoodDelta, createMoodTracker, type MoodTracker } from './botMood';
 import { GlobalPushToTalk, startGlobalPushToTalk } from './globalPushToTalk';
 import { createLedStatusController, LedStatusController } from './ledStatus';
+import { createFiniteEntityStateRepair } from './movementRecovery';
 import { createElevenLabsSpeaker, ElevenLabsSpeaker } from './services/elevenLabs';
 import { BuildStatus } from './services/builder';
 import { startVoiceServer, VoiceServer } from './voiceServer';
@@ -213,6 +214,10 @@ export function launchUI(config: BotConfig): void {
     void voiceSpeaker?.speak(message);
   }
 
+  function botSayVoiceOnly(message: string) {
+    void voiceSpeaker?.speak(message);
+  }
+
   function followPlayer(username: string) {
     const target = bot.players[username]?.entity;
 
@@ -228,6 +233,25 @@ export function launchUI(config: BotConfig): void {
 
     bot.pathfinder.setMovements(new Movements(bot));
     bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
+  }
+
+  function formatVec3(value: { x: number; y: number; z: number } | undefined): string {
+    if (!value) return 'n/a';
+    return `${value.x.toFixed(3)},${value.y.toFixed(3)},${value.z.toFixed(3)}`;
+  }
+
+  function logMovementDebug(event: string, extra = '') {
+    const entity = bot.entity;
+    const controls = (bot as any).controlState;
+    const controlText = controls
+      ? `ctrl=f:${Number(Boolean(controls.forward))} b:${Number(Boolean(controls.back))} l:${Number(Boolean(controls.left))} r:${Number(Boolean(controls.right))} j:${Number(Boolean(controls.jump))} s:${Number(Boolean(controls.sprint))}`
+      : 'ctrl=n/a';
+    const mode = bot.game?.gameMode ?? 'unknown';
+    const physics = String((bot as any).physicsEnabled);
+    const autoEat = (bot as any).autoEat?.isEating ? ' eating' : '';
+    const position = formatVec3(entity?.position);
+    const velocity = formatVec3(entity?.velocity);
+    logSystem(`[move-debug] ${event} mode=${mode} physics=${physics}${autoEat} pos=${position} vel=${velocity} ${controlText}${extra ? ` ${extra}` : ''}`);
   }
 
   async function startVoiceCommands() {
@@ -384,6 +408,43 @@ export function launchUI(config: BotConfig): void {
     loadPluginSafely('mineflayer-pvp', pvpPlugin);
     loadPluginSafely('mineflayer-armor-manager', armorManager);
 
+    const repairEntityState = createFiniteEntityStateRepair(bot, logSystem);
+
+    bot.on('entityHurt', (entity) => {
+      if (bot.entity && entity === bot.entity) {
+        repairEntityState('entityHurt');
+        logMovementDebug('entityHurt');
+      }
+    });
+
+    bot.on('health', () => {
+      repairEntityState('health');
+      logMovementDebug('health', `hp=${(bot.health ?? 0).toFixed(1)} food=${bot.food ?? 0}`);
+    });
+
+    (bot as any)._client?.on?.('entity_velocity', (packet: any) => {
+      if (!bot.entity || packet.entityId !== bot.entity.id) return;
+      const raw = packet.velocity
+        ? `${packet.velocity.x},${packet.velocity.y},${packet.velocity.z}`
+        : `${packet.velocityX},${packet.velocityY},${packet.velocityZ}`;
+      repairEntityState('entity_velocity');
+      logMovementDebug('entity_velocity', `raw=${raw}`);
+    });
+
+    bot.on('forcedMove', () => {
+      repairEntityState('forcedMove');
+      logMovementDebug('forcedMove');
+    });
+
+    bot.on('physicsTick', () => {
+      repairEntityState('physicsTick');
+    });
+
+    bot.on('path_update', (results: any) => {
+      repairEntityState('path_update');
+      logMovementDebug('path_update', `status=${results?.status ?? 'unknown'} len=${results?.path?.length ?? 'n/a'}`);
+    });
+
     bot.on('spawn', () => {
       prevHealth = bot.health ?? prevHealth;
     });
@@ -436,7 +497,7 @@ export function launchUI(config: BotConfig): void {
           },
           (msg) => {
             chatLog.log(`{yellow-fg}[auto]{/yellow-fg} ${msg}`);
-            botSay(msg);
+            botSayVoiceOnly(msg);
             screen.render();
           },
           (status) => {
