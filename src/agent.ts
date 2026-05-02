@@ -5,7 +5,7 @@ import type { Bot } from 'mineflayer';
 import { Movements, goals } from 'mineflayer-pathfinder';
 import { Vec3 } from 'vec3';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
-import { BuildSession, BuildStatus, rotateBlockState } from './services/builder';
+import { BuildSession, BuildStatus, PlacedBuild, rotateBlockState } from './services/builder';
 import { BuilderCrewSession } from './services/builderCrew';
 import { buildFromPrompt, editFromPrompt, findNearestBuild, listStoredBuilds, GeneratedBuild } from './services/geminiBuilder';
 import { MemoryManager } from './agent/MemoryManager';
@@ -2195,7 +2195,7 @@ export class MinecraftAgent {
       }
     };
 
-    let lastReplay: Promise<unknown> | null = null;
+    let lastReplay: Promise<{ build: PlacedBuild } | undefined> | null = null;
     const startReplay = (build: GeneratedBuild, label: string, isFinal: boolean): void => {
       const blocks = placeBuild(build);
       if (!blocks.length) return;
@@ -2209,9 +2209,10 @@ export class MinecraftAgent {
       this.builder.cancelBuild();
       this.builder.setFrameDelay(BASE_DELAY_MS);
       lastReplay = this.builder.awaitIdle()
-        .then(() => this.builder.replay(blocks, desc, origin, onReplayProgress))
+        .then(() => this.builder.replayFresh(blocks, desc, origin, onReplayProgress))
         .catch(err => {
           this.log(`[gemini-build] render failed (${label}): ${(err as Error).message}`);
+          return undefined;
         });
     };
 
@@ -2230,7 +2231,11 @@ export class MinecraftAgent {
 
     // Wait for whichever replay is currently running to finish (final pass was
     // kicked off inside the onPass callback above).
-    if (lastReplay) await lastReplay;
+    const finalReplay = (lastReplay ? await lastReplay : undefined) as { build: PlacedBuild } | undefined;
+    this.builder.endFreshSession();
+    if (finalReplay && generated.buildId) {
+      this.builder.registerPlaced(generated.buildId, finalReplay.build);
+    }
     const status = this.builder.getStatus();
     if (status.phase === 'error') {
       this.onAutonomousMessage?.(pickLine(lines.fail));
@@ -2281,8 +2286,9 @@ export class MinecraftAgent {
 
     this.builder.cancelBuild();
     await this.builder.awaitIdle();
+    this.builder.endFreshSession();
     const desc = `${generated.description} (edited: ${message.slice(0, 40)})`;
-    await this.builder.replay(blocks, desc, origin, (s) => this.onBuildStatus?.(s));
+    await this.builder.replayInto(buildId, blocks, desc, origin, (s) => this.onBuildStatus?.(s));
 
     const status = this.builder.getStatus();
     if (status.phase === 'error') {

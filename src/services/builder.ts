@@ -102,6 +102,8 @@ export class BuildSession {
   private status: BuildStatus = emptyStatus();
   private buildAbort = false;
   private buildInFlight: Promise<BuildStatus> | null = null;
+  private freshSessionActive = false;
+  private placedById: Map<string, PlacedBuild> = new Map();
   private readonly opts: ResolvedBuildSessionOptions;
 
   constructor(
@@ -132,12 +134,9 @@ export class BuildSession {
     this.activeFrameDelayMs = Math.max(0, ms);
   }
 
-  defaultOrigin(_player?: PlayerContext): Origin {
-    // Anchor at the BOT, not the player: project 8 blocks in front of the bot
-    // along its own yaw, then snap Y to the terrain surface so the build sits
-    // on the ground rather than floating at the bot's eye level.
-    const p = this.bot.entity?.position;
-    const yaw = this.bot.entity?.yaw ?? 0;
+  defaultOrigin(player?: PlayerContext): Origin {
+    const p = player?.position ?? this.bot.entity?.position;
+    const yaw = player?.yaw ?? this.bot.entity?.yaw ?? 0;
     if (!p) return { x: 0, y: 64, z: 0, rotation: 0 };
     const dx = -Math.sin(yaw) * 8;
     const dz = -Math.cos(yaw) * 8;
@@ -186,6 +185,73 @@ export class BuildSession {
     return { build: next, status };
   }
 
+  /**
+   * Like replay(), but starts a fresh build: ignores `this.current` so an
+   * unrelated prior build at a different origin isn't torn down. Successive
+   * calls (iterative passes) still diff against each other.
+   */
+  async replayFresh(
+    blocks: BlockPlacement[],
+    description: string,
+    origin: Origin,
+    onProgress?: (status: BuildStatus) => void,
+  ): Promise<{ build: PlacedBuild; status: BuildStatus }> {
+    if (!blocks.length) throw new Error('replayFresh called with no blocks');
+    if (!this.freshSessionActive) {
+      this.current = null;
+      this.freshSessionActive = true;
+    }
+    const result = await this.replay(blocks, description, origin, onProgress);
+    return result;
+  }
+
+  /** Mark the fresh-build session as ended; the next replayFresh starts clean. */
+  endFreshSession(): void {
+    this.freshSessionActive = false;
+  }
+
+  /**
+   * Edit a previously placed build identified by `id`. Diffs against the
+   * stored placement for that id (not `this.current`), so editing build A
+   * while build B is also on the ground won't tear down B.
+   */
+  async replayInto(
+    id: string,
+    blocks: BlockPlacement[],
+    description: string,
+    origin: Origin,
+    onProgress?: (status: BuildStatus) => void,
+  ): Promise<{ build: PlacedBuild; status: BuildStatus }> {
+    if (!blocks.length) throw new Error('replayInto called with no blocks');
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (const b of blocks) {
+      if (b.x < minX) minX = b.x; if (b.y < minY) minY = b.y; if (b.z < minZ) minZ = b.z;
+      if (b.x > maxX) maxX = b.x; if (b.y > maxY) maxY = b.y; if (b.z > maxZ) maxZ = b.z;
+    }
+    const built: PlacedBuild = {
+      blocks,
+      bounds: { min: { x: minX, y: minY, z: minZ }, max: { x: maxX, y: maxY, z: maxZ } },
+      origin,
+      description,
+      material: blocks[0]?.block ?? null,
+    };
+    const next = this.withTerrainFoundation(built);
+    const prior = this.placedById.get(id) ?? null;
+    const status = await this.applyTransition(prior, next, onProgress, { updateCurrent: false });
+    this.placedById.set(id, next);
+    return { build: next, status };
+  }
+
+  /** Register a placed build under an id so future edits diff against it. */
+  registerPlaced(id: string, build: PlacedBuild): void {
+    this.placedById.set(id, build);
+  }
+
+  forgetPlaced(id: string): void {
+    this.placedById.delete(id);
+  }
+
   async demolish(onProgress?: (status: BuildStatus) => void): Promise<BuildStatus> {
     if (!this.current) {
       this.status = { ...emptyStatus(), phase: 'done', message: 'Nothing to demolish' };
@@ -193,6 +259,7 @@ export class BuildSession {
     }
     const status = await this.applyTransition(this.current, null, onProgress);
     this.current = null;
+    this.freshSessionActive = false;
     return status;
   }
 
@@ -243,7 +310,9 @@ export class BuildSession {
     old: PlacedBuild | null,
     next: PlacedBuild | null,
     onProgress?: (status: BuildStatus) => void,
+    opts?: { updateCurrent?: boolean },
   ): Promise<BuildStatus> {
+    const updateCurrent = opts?.updateCurrent ?? true;
     if (this.buildInFlight) {
       this.buildAbort = true;
       try { await this.buildInFlight; } catch { /* ignore */ }
@@ -287,7 +356,7 @@ export class BuildSession {
     toPlace.sort((a, b) => a.y - b.y || a.x - b.x || a.z - b.z);
     const ops: BlockPlacement[] = [...toClear, ...terrainClear, ...toPlace];
 
-    this.current = next;
+    if (updateCurrent) this.current = next;
     this.status = {
       phase: 'building',
       description: next?.description ?? (old ? `tearing down ${old.description}` : 'idle'),
