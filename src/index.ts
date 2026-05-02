@@ -45,6 +45,18 @@ async function main() {
       default: process.env.MC_USERNAME ?? 'companion',
     },
     {
+      type: 'list',
+      name: 'personality',
+      message: 'Companion personality:',
+      choices: [
+        { name: 'Friendly  — warm, casual, helpful', value: 'friendly' },
+        { name: 'Flirty    — playful, charming, a little too fond of you', value: 'flirty' },
+        { name: 'Tsundere  — grumpy on the surface, secretly caring', value: 'tsundere' },
+        { name: 'Arrogant  — condescending, superior, insufferably capable', value: 'arrogant' },
+      ],
+      default: process.env.MC_PERSONALITY ?? 'friendly',
+    },
+    {
       type: 'input',
       name: 'ignoredUsernames',
       message: 'Other bot usernames to ignore (comma-separated):',

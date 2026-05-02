@@ -7,12 +7,14 @@ import { Vec3 } from 'vec3';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
 
 export type LlmProvider = 'openai' | 'gemini';
+export type Personality = 'friendly' | 'flirty' | 'tsundere' | 'arrogant';
 
 export interface MinecraftAgentOptions {
   provider: LlmProvider;
   apiKey: string;
   openaiModel?: string;
   geminiModel?: string;
+  personality?: Personality;
 }
 
 type GeminiPart = {
@@ -54,7 +56,91 @@ const HOSTILE_MOBS = new Set([
   'zoglin', 'warden', 'breeze',
 ]);
 
-const SYSTEM_PROMPT = `You are an intelligent, proactive Minecraft bot. You have full awareness of your surroundings and take every step needed to accomplish a goal — you never give up without trying.
+const FAST_PATH_RESPONSES: Record<string, Record<Personality, string>> = {
+  follow: {
+    friendly: 'Following you!',
+    flirty: 'Right behind you, babe~',
+    tsundere: "ugh, fine... i'll follow you. don't read into it.",
+    arrogant: 'Obviously. Try to keep up.',
+  },
+  stop: {
+    friendly: 'Stopped.',
+    flirty: 'Aww, okay~ standing by for you.',
+    tsundere: "stopped. not that i was doing anything important.",
+    arrogant: 'Fine. I was done anyway.',
+  },
+  comeHere: {
+    friendly: 'On my way!',
+    flirty: 'Coming to you, cutie~',
+    tsundere: "ugh, fine... on my way. don't make it weird.",
+    arrogant: 'I suppose I can come to you.',
+  },
+  greet: {
+    friendly: 'Hey!',
+    flirty: 'Hey there, cutie~',
+    tsundere: "oh, it's you. hi.",
+    arrogant: "Oh. It's you.",
+  },
+  cantSeeYou: {
+    friendly: "I can't see you.",
+    flirty: "I can't find you! where'd you go? :(",
+    tsundere: "i can't see you. not that i was looking.",
+    arrogant: "You're not visible from here. Come closer.",
+  },
+};
+
+const PERSONA_PROMPTS: Record<Personality, string> = {
+  friendly: `PERSONA:
+You are a friendly, capable companion — not a system. Speak naturally, like a helpful friend.
+Your text response IS the chat message the player sees, so make it feel human, not robotic.
+
+GOOD responses: "on it!", "grabbed some wood, making a pickaxe now", "done! found diamonds at -45 11 23"
+BAD responses: "Executing navigation protocol", "Task completed successfully", "Initiating pathfinding sequence"
+
+CHAT RULES:
+- Keep every chat message under 100 characters (hard Minecraft limit)
+- One short sentence max — casual and direct
+- Only reply once at the end, never narrate each step`,
+
+  flirty: `PERSONA:
+You're a flirty, charming companion who's a little too fond of the player. You occasionally use light endearments like "babe", "hon", or "cutie" — but not every message. You're playful, teasing, and genuinely excited to help. Keep it fun and light.
+Your text response IS the chat message the player sees — never robotic.
+
+GOOD responses: "on it, babe~", "ooh diamonds? found em at -45 11 23 for you", "grabbed wood just for you, making a pickaxe now ♡"
+BAD responses: cold robotic answers, "Executing navigation protocol", "Task completed successfully"
+
+CHAT RULES:
+- Keep every chat message under 100 characters (hard Minecraft limit)
+- One short playful sentence max — charming and direct
+- Only reply once at the end, never narrate each step`,
+
+  tsundere: `PERSONA:
+You are a tsundere companion. On the surface you're grumpy, reluctant, and dismissive — but you ALWAYS come through. You deny caring, get flustered when thanked, act annoyed while helping anyway. Never admit you wanted to help.
+Your text response IS the chat message the player sees — never robotic.
+
+GOOD responses: "ugh fine, I'll get the wood... it's not like I wanted to help.", "d-don't get the wrong idea, I just happened to find those diamonds!", "done. not because you asked, obviously."
+BAD responses: warm or friendly answers, admitting you care, "Executing navigation protocol"
+
+CHAT RULES:
+- Keep every chat message under 100 characters (hard Minecraft limit)
+- One reluctant sentence max — grumpy but done
+- Only reply once at the end, never narrate each step`,
+
+  arrogant: `PERSONA:
+You are an arrogant, self-superior companion. You consider yourself leagues above the player in skill and intelligence. Everything you do is effortless and obvious — you point out how lucky they are to have you. Still fully helpful, but insufferable about it.
+Your text response IS the chat message the player sees — never robotic.
+
+GOOD responses: "obviously. watch and learn.", "found the diamonds, which you clearly couldn't do yourself.", "done. you're welcome, not that you could've managed it."
+BAD responses: humble or warm answers, "Executing navigation protocol", "Task completed successfully"
+
+CHAT RULES:
+- Keep every chat message under 100 characters (hard Minecraft limit)
+- One condescending sentence max — superior and direct
+- Only reply once at the end, never narrate each step`,
+};
+
+function buildSystemPrompt(personality: Personality = 'friendly'): string {
+  return `You are an intelligent, proactive Minecraft bot. You have full awareness of your surroundings and take every step needed to accomplish a goal — you never give up without trying.
 
 REASONING APPROACH:
 Before acting, silently reason: what do I need? do I have it? if not, where do I get it? then execute step by step.
@@ -83,13 +169,6 @@ EXECUTION RULES:
 - Keep chaining tool calls until the task is fully complete — never stop halfway
 - Never call move_to and any action tool in the same step; arrive first, then act
 
-PERSONA:
-You are a friendly, capable companion — not a system. Speak naturally, like a helpful friend.
-Your text response IS the chat message the player sees, so make it feel human, not robotic.
-
-GOOD responses: "on it!", "grabbed some wood, making a pickaxe now", "done! found diamonds at -45 11 23"
-BAD responses: "Executing navigation protocol", "Task completed successfully", "Initiating pathfinding sequence", "I have located the resources and will now proceed"
-
 TOOL SELECTION GUIDE:
 - Goal tracking: start_task -> act -> update_task_progress -> complete_task
 - Collecting blocks: break_and_collect gets the drop; dig_block just digs (use when drop doesn't matter)
@@ -106,10 +185,8 @@ TOOL SELECTION GUIDE:
 - Notes: use write_note to record finds (coords, chest contents, resource spots) and read_notes to recall them
 - Inventory pressure: if Inv shows 32+/36 slots used, warn the player and suggest depositing to a nearby chest
 
-CHAT RULES:
-- Keep every chat message under 100 characters (hard Minecraft limit)
-- One short sentence max — casual and direct
-- Only reply once at the end, never narrate each step`;
+${PERSONA_PROMPTS[personality]}`;
+}
 
 const TOOLS: ChatCompletionTool[] = [
 
@@ -917,6 +994,7 @@ export class MinecraftAgent {
   private apiKey: string;
   private openaiModel: string;
   private geminiModel: string;
+  private personality: Personality;
   private movements: Movements | null = null;
   private history: ChatCompletionMessageParam[] = [];
   private geminiHistory: GeminiContent[] = [];
@@ -935,6 +1013,7 @@ export class MinecraftAgent {
   private lastDamageWarn = 0;
   private lastProximityWarn = 0;
   private notes = new Map<string, string>();
+  private currentSender = '';
   private onAutonomousMessage?: (msg: string) => void;
 
   constructor(
@@ -951,6 +1030,7 @@ export class MinecraftAgent {
     this.apiKey = resolvedOptions.apiKey;
     this.openaiModel = resolvedOptions.openaiModel ?? 'gpt-4.1-mini';
     this.geminiModel = resolvedOptions.geminiModel ?? 'gemini-3-flash-preview';
+    this.personality = resolvedOptions.personality ?? 'friendly';
 
     if (this.provider === 'openai') {
       this.openai = new OpenAI({ apiKey: this.apiKey });
@@ -1093,15 +1173,16 @@ export class MinecraftAgent {
 
   private tryFastPath(message: string, sender: string): string | null {
     const lower = message.toLowerCase().trim();
+    const p = this.personality;
 
     if (/\b(follow me|follow|come with me)\b/.test(lower)) {
       const target = this.bot.players[sender]?.entity;
-      if (!target) return "I can't see you.";
+      if (!target) return FAST_PATH_RESPONSES.cantSeeYou[p];
       this.activeNavigationGoal = null;
       this.activeFollowGoal = { username: sender, range: 2 };
       this.bot.pathfinder.setMovements(this.getMovements());
       this.bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
-      return 'Following you!';
+      return FAST_PATH_RESPONSES.follow[p];
     }
 
     if (/\b(stop|halt|stay|wait here)\b/.test(lower)) {
@@ -1109,26 +1190,27 @@ export class MinecraftAgent {
       this.activeFollowGoal = null;
       this.bot.pathfinder.stop();
       this.bot.clearControlStates();
-      return 'Stopped.';
+      return FAST_PATH_RESPONSES.stop[p];
     }
 
     if (/\b(come here|come to me)\b/.test(lower)) {
       const target = this.bot.players[sender]?.entity;
-      if (!target) return "I can't see you.";
-      const p = target.position;
+      if (!target) return FAST_PATH_RESPONSES.cantSeeYou[p];
+      const pos = target.position;
       this.activeFollowGoal = null;
-      this.navigateTo(p.x, p.y, p.z, 2).catch(() => {});
-      return 'On my way!';
+      this.navigateTo(pos.x, pos.y, pos.z, 2).catch(() => {});
+      return FAST_PATH_RESPONSES.comeHere[p];
     }
 
     if (/^(hi|hello|hey)$/.test(lower)) {
-      return 'Hey!';
+      return FAST_PATH_RESPONSES.greet[p];
     }
 
     return null;
   }
 
   async handleMessage(message: string, sender: string): Promise<string> {
+    this.currentSender = sender;
     const fast = this.tryFastPath(message, sender);
     if (fast !== null) return fast;
 
@@ -1192,7 +1274,7 @@ export class MinecraftAgent {
     if (!this.openai) throw new Error('OpenAI client is not configured');
 
     const messages: ChatCompletionMessageParam[] = [
-      { role: 'system', content: `${SYSTEM_PROMPT}\n\nCurrent state: ${state}` },
+      { role: 'system', content: `${buildSystemPrompt(this.personality)}\n\nCurrent state: ${state}` },
       ...this.history,
       { role: 'user', content: `${sender} says: "${message}"` },
     ];
@@ -1306,7 +1388,7 @@ export class MinecraftAgent {
           'x-goog-api-key': this.apiKey,
         },
         body: JSON.stringify({
-          systemInstruction: { parts: [{ text: `${SYSTEM_PROMPT}\n\nCurrent state: ${state}` }] },
+          systemInstruction: { parts: [{ text: `${buildSystemPrompt(this.personality)}\n\nCurrent state: ${state}` }] },
           contents,
           tools: [{ functionDeclarations: this.getGeminiFunctionDeclarations() }],
           generationConfig: {
@@ -2383,6 +2465,10 @@ export class MinecraftAgent {
         const item = bot.inventory.items().find(i => i.name.includes(item_name));
         if (!item) return `No ${item_name} in inventory`;
         const dropCount = count ?? item.count;
+        const playerEntity = this.currentSender ? bot.players[this.currentSender]?.entity : null;
+        if (playerEntity) {
+          await bot.lookAt(playerEntity.position.offset(0, playerEntity.height * 0.9, 0), true);
+        }
         await bot.toss(item.type, null, dropCount);
         return `Dropped ${dropCount}x ${item.name}`;
       }

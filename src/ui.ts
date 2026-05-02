@@ -320,7 +320,7 @@ export function launchUI(config: BotConfig): void {
       void (bot as any).armorManager?.equipAll?.().catch?.(() => undefined);
 
       if (openaiApiKey) {
-        agent = new MinecraftAgent(bot, openaiApiKey, (msg) => {
+        agent = new MinecraftAgent(bot, { provider: 'openai', apiKey: openaiApiKey, personality: config.personality }, (msg) => {
           logAgent(msg);
         }, (msg) => {
           chatLog.log(`{yellow-fg}[auto]{/yellow-fg} ${msg}`);
