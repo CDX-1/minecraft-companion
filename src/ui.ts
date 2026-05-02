@@ -1,10 +1,9 @@
 import blessed from 'blessed';
 import mineflayer, { Bot } from 'mineflayer';
 import { pathfinder, Movements, goals } from 'mineflayer-pathfinder';
-import { parseChatCommand } from './commands';
 import { BotConfig } from './config';
+import { MinecraftAgent } from './agent';
 import { createElevenLabsSpeaker, ElevenLabsSpeaker } from './services/elevenLabs';
-import { handleVoiceTranscript } from './voiceCommands';
 import { startVoiceServer, VoiceServer } from './voiceServer';
 
 export function launchUI(config: BotConfig): void {
@@ -66,6 +65,9 @@ export function launchUI(config: BotConfig): void {
 
   let voiceServer: VoiceServer | null = null;
   let voiceSpeaker: ElevenLabsSpeaker | null = null;
+  let agent: MinecraftAgent | null = null;
+
+  const openaiApiKey = process.env.OPENAI_API_KEY?.trim();
 
   screen.key(['C-c'], () => {
     voiceServer?.close();
@@ -76,8 +78,6 @@ export function launchUI(config: BotConfig): void {
   // ── Bot ───────────────────────────────────────────────────
   let bot: Bot;
   let infoTimer: NodeJS.Timeout | null = null;
-
-  const FOLLOW_RANGE = 2;
 
   function setupElevenLabs() {
     if (!config.elevenLabsEnabled) return;
@@ -126,7 +126,7 @@ export function launchUI(config: BotConfig): void {
     screen.render();
 
     bot.pathfinder.setMovements(new Movements(bot));
-    bot.pathfinder.setGoal(new goals.GoalFollow(target, FOLLOW_RANGE), true);
+    bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
   }
 
   async function startVoiceCommands() {
@@ -139,20 +139,29 @@ export function launchUI(config: BotConfig): void {
           chatLog.log(`{magenta-fg}[voice]{/magenta-fg} ${text}`);
 
           if (!bot?.entity) {
-            chatLog.log('{yellow-fg}[voice] Bot is not spawned yet; command ignored.{/yellow-fg}');
+            chatLog.log('{yellow-fg}[voice] Bot not spawned; command ignored.{/yellow-fg}');
             screen.render();
             return;
           }
 
-          const handled = handleVoiceTranscript(text, {
-            characterName: bot.username,
-            ownerUsername: config.ownerUsername,
-            sayHello: () => botSay('hello'),
-            follow: followPlayer,
-          });
-
-          if (!handled) {
-            chatLog.log('{yellow-fg}[voice] No matching command, or owner username is missing.{/yellow-fg}');
+          if (agent) {
+            const sender = config.ownerUsername ?? 'voice';
+            agent
+              .handleMessage(text, sender)
+              .then((response) => { if (response) botSay(response); })
+              .catch((err: Error) => {
+                chatLog.log(`{red-fg}[agent] voice error: ${err.message}{/red-fg}`);
+                screen.render();
+              });
+          } else {
+            const lower = text.toLowerCase();
+            if (lower.includes('hello') || lower.includes('hi')) {
+              botSay('hello');
+            } else if (lower === 'follow me') {
+              if (config.ownerUsername) followPlayer(config.ownerUsername);
+            } else {
+              chatLog.log('{yellow-fg}[voice] No matching command.{/yellow-fg}');
+            }
           }
 
           screen.render();
@@ -198,6 +207,17 @@ export function launchUI(config: BotConfig): void {
       statusBar.style.bg = 'green';
       chatLog.log(`{green-fg}[system] Spawned as ${bot.username}{/green-fg}`);
       infoTimer = setInterval(renderInfo, 1000);
+
+      if (openaiApiKey) {
+        agent = new MinecraftAgent(bot, openaiApiKey, (msg) => {
+          chatLog.log(`{gray-fg}${msg}{/gray-fg}`);
+          screen.render();
+        });
+        chatLog.log(`{green-fg}[agent] GPT-4o-mini agent ready{/green-fg}`);
+      } else {
+        chatLog.log(`{yellow-fg}[agent] No OPENAI_API_KEY — using basic commands only{/yellow-fg}`);
+      }
+
       screen.render();
     });
 
@@ -206,15 +226,27 @@ export function launchUI(config: BotConfig): void {
       chatLog.log(`{cyan-fg}<${username}>{/cyan-fg} ${message}`);
       screen.render();
 
-      const command = parseChatCommand(message, bot.username);
-
-      if (command === 'greet') {
-        botSay('hello');
+      if (!agent) {
+        if (message.toLowerCase().includes('hello') || message.toLowerCase().includes('hi')) {
+          botSay('hello');
+        } else if (message.toLowerCase() === 'follow me') {
+          followPlayer(username);
+        }
+        return;
       }
 
-      if (command === 'follow') {
-        followPlayer(username);
-      }
+      chatLog.log(`{gray-fg}[agent] thinking…{/gray-fg}`);
+      screen.render();
+
+      agent
+        .handleMessage(message, username)
+        .then((response) => {
+          if (response) botSay(response);
+        })
+        .catch((err: Error) => {
+          chatLog.log(`{red-fg}[agent] error: ${err.message}{/red-fg}`);
+          screen.render();
+        });
     });
 
     bot.on('error', (err) => {
