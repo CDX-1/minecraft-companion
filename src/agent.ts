@@ -1125,6 +1125,7 @@ export class MinecraftAgent {
           auth: resolvedOptions.buildCrew.auth,
           mainUsername: resolvedOptions.buildCrew.mainUsername,
           crewSize: resolvedOptions.buildCrew.size,
+          version: bot.version,
           frameDelayMs: 100,
           commandBot: bot,
           log,

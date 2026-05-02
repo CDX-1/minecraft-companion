@@ -26,6 +26,7 @@ export interface BuilderCrewOptions {
   auth: 'offline' | 'microsoft';
   mainUsername: string;
   crewSize: number;
+  version?: string;
   frameDelayMs?: number;
   splitDelayMs?: number;
   mergeDelayMs?: number;
@@ -33,7 +34,7 @@ export interface BuilderCrewOptions {
   spawnTimeoutMs?: number;
   log?: (message: string) => void;
   commandBot?: Pick<Bot, 'chat'>;
-  createBot?: (options: BuilderCrewCreateBotOptions) => Bot;
+  createBot?: (options: BuilderCrewCreateBotOptions & { version?: string }) => Bot;
 }
 
 export function makeCrewUsername(baseUsername: string, index: number): string {
@@ -74,15 +75,18 @@ export class BuilderCrewSession {
     this.cancelled = false;
     const createBot = this.opts.createBot ?? mineflayer.createBot;
     const assignments = assignCrewWork(ops, this.opts.crewSize);
-    this.helpers = assignments.map((_, index) => createBot({
+    
+    const usernames = assignments.map((_, index) => makeCrewUsername(this.opts.mainUsername, index));
+    this.helpers = usernames.map(username => createBot({
       host: this.opts.host,
       port: this.opts.port,
-      username: makeCrewUsername(this.opts.mainUsername, index),
+      username,
       auth: this.opts.auth,
+      version: this.opts.version,
     }));
 
     try {
-      await Promise.all(this.helpers.map(bot => this.waitForSpawn(bot)));
+      await Promise.all(this.helpers.map((bot, index) => this.waitForSpawn(bot, usernames[index])));
       let placed = 0;
       this.opts.log?.(`[build-crew] helpers online: ${this.helpers.map(bot => bot.username).join(', ')}`);
       if (origin) await this.splitFromOrigin(origin);
@@ -134,14 +138,16 @@ export class BuilderCrewSession {
     this.opts.commandBot?.chat(message);
   }
 
-  private async waitForSpawn(bot: Bot): Promise<void> {
-    const timeoutMs = this.opts.spawnTimeoutMs ?? 8000;
+  private async waitForSpawn(bot: Bot, expectedUsername: string): Promise<void> {
+    const timeoutMs = this.opts.spawnTimeoutMs ?? 30000;
     const emitter = bot as unknown as NodeJS.EventEmitter;
     await new Promise<void>((resolve, reject) => {
       const cleanup = () => {
         clearTimeout(timeout);
         emitter.removeListener('spawn', onSpawn);
         emitter.removeListener('error', onError);
+        emitter.removeListener('kicked', onKicked);
+        emitter.removeListener('end', onEnd);
       };
       const onSpawn = () => {
         cleanup();
@@ -151,13 +157,23 @@ export class BuilderCrewSession {
         cleanup();
         reject(err instanceof Error ? err : new Error(String(err)));
       };
+      const onKicked = (reason: string) => {
+        cleanup();
+        reject(new Error(`Helper ${expectedUsername} kicked: ${reason}`));
+      };
+      const onEnd = (reason: string) => {
+        cleanup();
+        reject(new Error(`Helper ${expectedUsername} ended: ${reason}`));
+      };
       const timeout = setTimeout(() => {
         cleanup();
-        reject(new Error(`Helper ${bot.username} did not spawn within ${timeoutMs}ms`));
+        reject(new Error(`Helper ${expectedUsername} did not spawn within ${timeoutMs}ms`));
       }, timeoutMs);
 
       emitter.once('spawn', onSpawn);
       emitter.once('error', onError);
+      emitter.once('kicked', onKicked);
+      emitter.once('end', onEnd);
     });
   }
 }
