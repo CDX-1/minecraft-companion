@@ -5,7 +5,7 @@ import { shouldIgnoreChatSender } from './chatFilter';
 import { parseChatCommand } from './commands';
 import { BotConfig } from './config';
 import { MinecraftAgent } from './agent';
-import type { Personality } from './agent/types';
+import { FAST_PATH_RESPONSES, type Personality } from './agent/types';
 
 const PERSONALITIES: Personality[] = ['friendly', 'flirty', 'tsundere', 'arrogant'];
 import { classifyDamageMoodDelta, createMoodTracker, type MoodTracker } from './botMood';
@@ -15,6 +15,7 @@ import { createFiniteEntityStateRepair } from './movementRecovery';
 import { createElevenLabsSpeaker, ElevenLabsSpeaker } from './services/elevenLabs';
 import { BuildStatus } from './services/builder';
 import { startVoiceServer, VoiceServer } from './voiceServer';
+import { createDistanceHoldDetector } from './waveGesture';
 
 const armorManager = require('mineflayer-armor-manager');
 const collectBlockPlugin = require('mineflayer-collectblock').plugin;
@@ -121,6 +122,7 @@ export function launchUI(config: BotConfig): void {
   // ── Bot ───────────────────────────────────────────────────
   let bot: Bot;
   let infoTimer: NodeJS.Timeout | null = null;
+  let waveGestureRunning = false;
 
   function logSystem(message: string) {
     chatLog.log(`{green-fg}[system]{/green-fg} ${message}`);
@@ -147,9 +149,19 @@ export function launchUI(config: BotConfig): void {
     screen.render();
   }
 
+  const waveDetector = createDistanceHoldDetector({
+    threshold: 20,
+    holdMs: 1000,
+    onHold: (distance) => {
+      logSystem(`Wave detected at ${distance.toFixed(1)}cm`);
+      void performWaveThanks();
+    },
+  });
+
   ledStatus = createLedStatusController({
     log: logSystem,
     warn: logWarning,
+    onSerialLine: (line) => waveDetector.acceptLine(line),
   });
   moodTracker = createMoodTracker({
     log: logSystem,
@@ -165,6 +177,40 @@ export function launchUI(config: BotConfig): void {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logWarning(`Plugin ${name} not loaded: ${message}`);
+    }
+  }
+
+  async function performWaveThanks(): Promise<void> {
+    if (waveGestureRunning) return;
+    if (!bot?.entity) {
+      logWarning('Wave detected before bot spawned.');
+      return;
+    }
+
+    waveGestureRunning = true;
+    try {
+      const target = config.ownerUsername
+        ? bot.players[config.ownerUsername]?.entity
+        : Object.entries(bot.players).find(([username, player]) => username !== bot.username && player.entity)?.[1].entity;
+
+      if (target) {
+        await bot.lookAt(target.position.offset(0, (target.height ?? 1.8) * 0.9, 0), true);
+      }
+
+      for (let i = 0; i < 2; i += 1) {
+        bot.setControlState('sneak', true);
+        await new Promise<void>(resolve => setTimeout(resolve, 250));
+        bot.setControlState('sneak', false);
+        await new Promise<void>(resolve => setTimeout(resolve, 200));
+      }
+
+      botSay(personalityGreeting());
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logWarning(`Wave gesture failed: ${message}`);
+    } finally {
+      bot.setControlState('sneak', false);
+      waveGestureRunning = false;
     }
   }
 
@@ -220,6 +266,10 @@ export function launchUI(config: BotConfig): void {
 
   function botSayVoiceOnly(message: string) {
     void voiceSpeaker?.speak(message);
+  }
+
+  function personalityGreeting(): string {
+    return FAST_PATH_RESPONSES.greet[config.personality] ?? 'hello';
   }
 
   function followPlayer(username: string) {
@@ -286,7 +336,7 @@ export function launchUI(config: BotConfig): void {
             const command = parseChatCommand(text, bot.username);
 
             if (command === 'greet') {
-              botSay('hello');
+              botSay(personalityGreeting());
             } else if (command === 'follow') {
               if (config.ownerUsername) followPlayer(config.ownerUsername);
             } else {
@@ -563,7 +613,7 @@ export function launchUI(config: BotConfig): void {
         const command = parseChatCommand(message, bot.username);
 
         if (command === 'greet') {
-          botSay('hello');
+          botSay(personalityGreeting());
         } else if (command === 'follow') {
           followPlayer(username);
         }

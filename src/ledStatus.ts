@@ -1,5 +1,6 @@
 import { SerialPort } from 'serialport';
 import { existsSync, readdirSync } from 'node:fs';
+import { createSerialLineAccumulator } from './waveGesture';
 
 export type LedStatus = 'green' | 'yellow' | 'red';
 
@@ -16,6 +17,7 @@ export interface LedStatusOptions {
   baudRate?: number;
   log?: (message: string) => void;
   warn?: (message: string) => void;
+  onSerialLine?: (line: string) => void;
 }
 
 const STATUS_COMMANDS: Record<LedStatus, string> = {
@@ -45,6 +47,7 @@ export function createLedStatusController(options: LedStatusOptions = {}): LedSt
     baudRate,
     autoOpen: false,
   });
+  const serialLines = createSerialLineAccumulator((line) => options.onSerialLine?.(line));
 
   port.on('open', () => {
     isOpen = true;
@@ -59,6 +62,10 @@ export function createLedStatusController(options: LedStatusOptions = {}): LedSt
 
   port.on('close', () => {
     isOpen = false;
+  });
+
+  port.on('data', (chunk: Buffer | string) => {
+    serialLines.acceptChunk(chunk);
   });
 
   port.open((err) => {
