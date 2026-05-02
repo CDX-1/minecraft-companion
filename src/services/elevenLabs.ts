@@ -21,7 +21,6 @@ export interface ElevenLabsSpeaker {
 const SAMPLE_RATE = 16000;
 const CHANNELS = 1;
 const MAX_CACHE = 24;
-let warnedMacStreamingFallback = false;
 
 export function createElevenLabsSpeaker(config: ElevenLabsConfig, logger?: (message: string) => void): ElevenLabsSpeaker {
   let queue = Promise.resolve();
@@ -95,14 +94,6 @@ async function synthesizeSpeech(text: string, config: ElevenLabsConfig): Promise
 }
 
 async function streamSpeech(text: string, config: ElevenLabsConfig, logger?: (message: string) => void): Promise<boolean> {
-  if (process.platform === 'darwin') {
-    if (!warnedMacStreamingFallback) {
-      warnedMacStreamingFallback = true;
-      logger?.('[voice] ElevenLabs streaming disabled on macOS to avoid CoreAudio buffer warnings; using buffered playback.');
-    }
-    return false;
-  }
-
   const stability = clamp01(config.stability);
   const similarityBoost = clamp01(config.similarityBoost);
   const latency = clampLatency(config.latency);
