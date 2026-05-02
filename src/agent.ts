@@ -583,7 +583,7 @@ export class MinecraftAgent {
       return 'On my way!';
     }
 
-    if (/\b(hi|hello|hey)\b/.test(lower)) {
+    if (/^(hi|hello|hey)$/.test(lower)) {
       return 'Hey!';
     }
 

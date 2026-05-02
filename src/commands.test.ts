@@ -21,4 +21,6 @@ test('parses follow command', () => {
 test('ignores unknown chat messages', () => {
   assert.equal(parseChatCommand('follow'), null);
   assert.equal(parseChatCommand('what is up'), null);
+  assert.equal(parseChatCommand('hey can you do this', 'companion'), null);
+  assert.equal(parseChatCommand('this is high priority', 'companion'), null);
 });

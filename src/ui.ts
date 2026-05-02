@@ -2,6 +2,7 @@ import blessed from 'blessed';
 import mineflayer, { Bot } from 'mineflayer';
 import { pathfinder, Movements, goals } from 'mineflayer-pathfinder';
 import { shouldIgnoreChatSender } from './chatFilter';
+import { parseChatCommand } from './commands';
 import { BotConfig } from './config';
 import { MinecraftAgent } from './agent';
 import { createElevenLabsSpeaker, ElevenLabsSpeaker } from './services/elevenLabs';
@@ -158,10 +159,11 @@ export function launchUI(config: BotConfig): void {
                 screen.render();
               });
           } else {
-            const lower = text.toLowerCase();
-            if (lower.includes('hello') || lower.includes('hi')) {
+            const command = parseChatCommand(text, bot.username);
+
+            if (command === 'greet') {
               botSay('hello');
-            } else if (lower === 'follow me') {
+            } else if (command === 'follow') {
               if (config.ownerUsername) followPlayer(config.ownerUsername);
             } else {
               chatLog.log('{yellow-fg}[voice] No matching command.{/yellow-fg}');
@@ -236,9 +238,11 @@ export function launchUI(config: BotConfig): void {
       screen.render();
 
       if (!agent) {
-        if (message.toLowerCase().includes('hello') || message.toLowerCase().includes('hi')) {
+        const command = parseChatCommand(message, bot.username);
+
+        if (command === 'greet') {
           botSay('hello');
-        } else if (message.toLowerCase() === 'follow me') {
+        } else if (command === 'follow') {
           followPlayer(username);
         }
         return;
