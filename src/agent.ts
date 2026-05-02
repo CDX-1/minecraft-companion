@@ -12,6 +12,52 @@ function looksLikeBuildIntent(message: string): boolean {
   return /\b(build|construct|erect|put up|create me|design me|make me a|spawn me a|tower|house|castle|villa|mansion|dome|sphere|pyramid|wall|bridge|arch|cube|staircase|obelisk|fountain|temple|shrine|cathedral|church|cottage|dock|pier|statue|monument|sakura|cherry blossom|dragon|death star)\b/i.test(message);
 }
 
+const BUILD_VOICELINES: Record<Personality, {
+  ack: string[];
+  start: string[];
+  mid: string[];
+  done: string[];
+  cancelled: string[];
+  fail: string[];
+}> = {
+  friendly: {
+    ack: ["ooh yeah, on it — gimme a sec to picture it!", "love that, sketching it out now!", "okay okay, I see it. starting now!"],
+    start: ["alright, laying it out — watch this!", "okay, here we go!", "starting the layout now!"],
+    mid: ["coming along nicely~", "halfway there, looking good!", "almost there, hang tight!"],
+    done: ["and... done! what do you think?", "there she is! how's it look?", "all yours — turned out pretty nice!"],
+    cancelled: ["okay okay, stopping!", "alright, putting the tools down."],
+    fail: ["ah dang, something went sideways. wanna try again?", "oof, hit a snag — maybe rephrase?"],
+  },
+  flirty: {
+    ack: ["mmm I love when you ask me to build, hon~ on it!", "ooh for you? anything. let me get it just right~", "say less cutie, I'm already imagining it ♡"],
+    start: ["okay babe, putting it together for you~", "starting it just for you, hon ♡", "watch me work, cutie~"],
+    mid: ["coming together beautifully~", "halfway and already gorgeous~", "almost done, sweet thing~"],
+    done: ["all done~ hope you love it ♡", "ta-da! built with love, babe~", "finished! do I get a kiss for that one?~"],
+    cancelled: ["okay babe, putting it down for you~", "stopping for you, hon~"],
+    fail: ["ohh no babe, something tripped me up. try again?~", "ugh, sorry hon — another go?"],
+  },
+  tsundere: {
+    ack: ["fine, I'll build your stupid thing. don't watch me.", "ugh, whatever. it's not like I wanted to build anyway.", "h-hold on, I'm thinking... not because I'm excited!"],
+    start: ["fine, starting. don't stare.", "ugh, here I go. happy?", "j-just watch quietly, okay?"],
+    mid: ["it's going... okay I guess.", "halfway. don't compliment me.", "almost done, sheesh."],
+    done: ["t-there. done. don't make a big deal of it!", "finished. it's not like I tried hard.", "done. you're welcome. or whatever."],
+    cancelled: ["fine, stopping. like I cared anyway.", "tch, whatever. dropping it."],
+    fail: ["t-tch, broke. NOT my fault.", "ugh, didn't work. try again or don't."],
+  },
+  arrogant: {
+    ack: ["trivial. stand back and watch a professional.", "obviously I can do that. try to keep up.", "fine, I'll grace you with one of my masterpieces."],
+    start: ["beginning the masterpiece. observe.", "commencing. try not to blink.", "watch and learn."],
+    mid: ["progressing flawlessly, as expected.", "halfway through perfection.", "nearly finished."],
+    done: ["complete. another flawless creation. you're welcome.", "behold. perfection, naturally.", "done. obviously stunning."],
+    cancelled: ["very well, halting. your loss.", "stopping. try to keep your requests consistent."],
+    fail: ["a rare hiccup — your request was unclear.", "tch. phrase it intelligently next time."],
+  },
+};
+
+function pickLine(lines: string[]): string {
+  return lines[Math.floor(Math.random() * lines.length)] ?? '';
+}
+
 export type LlmProvider = 'openai' | 'gemini';
 export type Personality = 'friendly' | 'flirty' | 'tsundere' | 'arrogant';
 
@@ -1322,13 +1368,13 @@ export class MinecraftAgent {
 
     if (looksLikeBuildIntent(message)) {
       this.currentSender = sender;
-      try {
-        return await this.runGeminiBuild(message, sender);
-      } catch (err) {
+      const lines = BUILD_VOICELINES[this.personality];
+      void this.runGeminiBuild(message, sender).catch(err => {
         const msg = err instanceof Error ? err.message : String(err);
         this.log(`[gemini-build] failed: ${msg}`);
-        return `Build failed: ${msg.slice(0, 80)}`;
-      }
+        this.onAutonomousMessage?.(pickLine(lines.fail));
+      });
+      return pickLine(lines.ack);
     }
 
     const bot = this.bot;
@@ -2095,9 +2141,13 @@ export class MinecraftAgent {
       ? { position: { x: playerEntity.position.x, y: playerEntity.position.y, z: playerEntity.position.z }, yaw: playerEntity.yaw }
       : undefined;
 
+    const lines = BUILD_VOICELINES[this.personality];
     this.log(`[gemini-build] generating: "${message}"`);
     const generated = await buildFromPrompt(message, this.log);
-    if (!generated.blocks.length) return "Gemini didn't return any blocks. Try rephrasing?";
+    if (!generated.blocks.length) {
+      this.onAutonomousMessage?.(pickLine(lines.fail));
+      return '';
+    }
 
     const origin = this.builder.defaultOrigin(playerCtx);
     const cx = Math.floor(generated.width / 2);
@@ -2109,10 +2159,32 @@ export class MinecraftAgent {
       block: b.block,
     }));
     const desc = `${generated.description} (${generated.width}×${generated.height}×${generated.length}, ${placed.length} blocks)`;
-    const { status } = await this.builder.replay(placed, desc, origin, s => this.onBuildStatus?.(s));
-    if (status.phase === 'error') return `Build failed: ${status.message ?? 'unknown'}`;
-    if (status.phase === 'cancelled') return `Build cancelled at ${status.placed}/${status.total}`;
-    return `Built it — ${placed.length} blocks at (${origin.x},${origin.y},${origin.z}).`;
+
+    let announcedStart = false;
+    let announcedMid = false;
+    const { status } = await this.builder.replay(placed, desc, origin, s => {
+      this.onBuildStatus?.(s);
+      if (s.phase === 'building') {
+        if (!announcedStart && s.placed > 0) {
+          announcedStart = true;
+          this.onAutonomousMessage?.(pickLine(lines.start));
+        }
+        if (!announcedMid && s.total > 0 && s.placed / s.total >= 0.5) {
+          announcedMid = true;
+          this.onAutonomousMessage?.(pickLine(lines.mid));
+        }
+      }
+    });
+    if (status.phase === 'error') {
+      this.onAutonomousMessage?.(pickLine(lines.fail));
+      return '';
+    }
+    if (status.phase === 'cancelled') {
+      this.onAutonomousMessage?.(pickLine(lines.cancelled));
+      return '';
+    }
+    this.onAutonomousMessage?.(pickLine(lines.done));
+    return '';
   }
 
   private makeVec3(x: number, y: number, z: number) {

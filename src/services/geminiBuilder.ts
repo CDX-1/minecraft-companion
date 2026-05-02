@@ -41,13 +41,17 @@ type GeminiTurn = { role: 'user' | 'model'; text: string };
 
 async function callGemini(turns: GeminiTurn[]): Promise<string> {
   const apiKey = getApiKey();
-  const model = process.env.GEMINI_MODEL || 'gemini-2.5-pro';
+  const model = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const body = {
     systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
     contents: turns.map(t => ({ role: t.role, parts: [{ text: t.text }] })),
-    generationConfig: { temperature: 0.7, maxOutputTokens: 32768 },
+    generationConfig: {
+      temperature: 0.7,
+      maxOutputTokens: 24576,
+      thinkingConfig: { thinkingBudget: 2000 },
+    },
   };
 
   const res = await fetch(url, {
