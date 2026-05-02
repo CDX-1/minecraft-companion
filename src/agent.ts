@@ -7,6 +7,8 @@ import { Vec3 } from 'vec3';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
 import { BuildSession, BuildStatus } from './services/builder';
 import { buildFromPrompt, GeneratedBuild } from './services/geminiBuilder';
+import { MemoryManager } from './agent/MemoryManager';
+import { StateMachine } from './agent/StateMachine';
 
 function looksLikeBuildIntent(message: string): boolean {
   return /\b(build|construct|erect|put up|create me|design me|make me a|spawn me a|tower|house|castle|villa|mansion|dome|sphere|pyramid|wall|bridge|arch|cube|staircase|obelisk|fountain|temple|shrine|cathedral|church|cottage|dock|pier|statue|monument|sakura|cherry blossom|dragon|death star)\b/i.test(message);
@@ -58,88 +60,21 @@ function pickLine(lines: string[]): string {
   return lines[Math.floor(Math.random() * lines.length)] ?? '';
 }
 
-export type LlmProvider = 'openai' | 'gemini';
-export type Personality = 'friendly' | 'flirty' | 'tsundere' | 'arrogant';
-
-export interface MinecraftAgentOptions {
-  provider: LlmProvider;
-  apiKey: string;
-  openaiModel?: string;
-  geminiModel?: string;
-  personality?: Personality;
-}
-
-type GeminiPart = {
-  text?: string;
-  functionCall?: { name: string; args?: Record<string, unknown> };
-  functionResponse?: { name: string; response: Record<string, unknown> };
-  thoughtSignature?: string;
-};
-
-type GeminiContent = { role: 'user' | 'model'; parts: GeminiPart[] };
-
-type GeminiGenerateContentResponse = {
-  candidates?: Array<{ content?: GeminiContent }>;
-  error?: { message?: string };
-};
-
-type StoredPosition = { x: number; y: number; z: number; dimension?: string; label?: string };
-type ActiveTask = { goal: string; plan: string[]; progress: string[]; startedAt: string; updatedAt: string };
-type NavigationGoal = { id: number; x: number; y: number; z: number; range: number };
-type FollowGoal = { username: string; range: number };
-
-type AgentMemory = {
-  version: 1;
-  owner?: string;
-  home?: StoredPosition;
-  knownChests: StoredPosition[];
-  knownResources: StoredPosition[];
-  avoidAreas: Array<StoredPosition & { reason: string }>;
-  notes: Record<string, string>;
-  activeTask?: ActiveTask;
-};
-
-const HOSTILE_MOBS = new Set([
-  'zombie', 'skeleton', 'creeper', 'spider', 'cave_spider', 'witch',
-  'blaze', 'ghast', 'slime', 'magma_cube', 'enderman', 'endermite',
-  'silverfish', 'guardian', 'elder_guardian', 'wither_skeleton',
-  'stray', 'husk', 'drowned', 'phantom', 'pillager', 'vindicator',
-  'evoker', 'ravager', 'vex', 'shulker', 'hoglin', 'piglin_brute',
-  'zoglin', 'warden', 'breeze',
-]);
-
-const FAST_PATH_RESPONSES: Record<string, Record<Personality, string>> = {
-  follow: {
-    friendly: 'Following you!',
-    flirty: 'Right behind you, babe~',
-    tsundere: "ugh, fine... i'll follow you. don't read into it.",
-    arrogant: 'Obviously. Try to keep up.',
-  },
-  stop: {
-    friendly: 'Stopped.',
-    flirty: 'Aww, okay~ standing by for you.',
-    tsundere: "stopped. not that i was doing anything important.",
-    arrogant: 'Fine. I was done anyway.',
-  },
-  comeHere: {
-    friendly: 'On my way!',
-    flirty: 'Coming to you, cutie~',
-    tsundere: "ugh, fine... on my way. don't make it weird.",
-    arrogant: 'I suppose I can come to you.',
-  },
-  greet: {
-    friendly: 'Hey!',
-    flirty: 'Hey there, cutie~',
-    tsundere: "oh, it's you. hi.",
-    arrogant: "Oh. It's you.",
-  },
-  cantSeeYou: {
-    friendly: "I can't see you.",
-    flirty: "I can't find you! where'd you go? :(",
-    tsundere: "i can't see you. not that i was looking.",
-    arrogant: "You're not visible from here. Come closer.",
-  },
-};
+import { 
+  LlmProvider, 
+  Personality, 
+  MinecraftAgentOptions, 
+  GeminiPart, 
+  GeminiContent, 
+  GeminiGenerateContentResponse,
+  StoredPosition,
+  ActiveTask,
+  NavigationGoal,
+  FollowGoal,
+  AgentMemory,
+  HOSTILE_MOBS,
+  FAST_PATH_RESPONSES
+} from './agent/types';
 
 const PERSONA_PROMPTS: Record<Personality, string> = {
   friendly: `PERSONA:
@@ -1137,9 +1072,8 @@ export class MinecraftAgent {
   private history: ChatCompletionMessageParam[] = [];
   private geminiHistory: GeminiContent[] = [];
   private readonly HISTORY_LIMIT = 24;
-  private readonly memoryPath = path.join(process.cwd(), '.minecraft-companion-memory.json');
-  private memory: AgentMemory = this.createEmptyMemory();
-  private homePosition: { x: number; y: number; z: number } | null = null;
+  private memoryManager: MemoryManager;
+  private stateMachine: StateMachine;
   private navigationSeq = 0;
   private activeNavigationGoal: NavigationGoal | null = null;
   private activeFollowGoal: FollowGoal | null = null;
@@ -1152,7 +1086,6 @@ export class MinecraftAgent {
   private lastProximityWarn = 0;
   private lastRecoveryTime = 0;
   private isThinking = false;
-  private notes = new Map<string, string>();
   private currentSender = '';
   private onAutonomousMessage?: (msg: string) => void;
   private builder: BuildSession;
@@ -1182,7 +1115,9 @@ export class MinecraftAgent {
     this.builder = new BuildSession(bot, log);
     this.onBuildStatus = onBuildStatus;
 
-    this.loadMemory();
+    this.memoryManager = new MemoryManager(this.log.bind(this));
+    this.stateMachine = new StateMachine(bot, this.memoryManager, this.log.bind(this), this.executeTool.bind(this));
+    
     this.onAutonomousMessage = onAutonomousMessage;
     if (onAutonomousMessage) this.startProactiveHooks();
   }
@@ -1195,50 +1130,19 @@ export class MinecraftAgent {
     this.onBuildStatus?.(this.builder.getStatus());
   }
 
-  private createEmptyMemory(): AgentMemory {
-    return {
-      version: 1,
-      knownChests: [],
-      knownResources: [],
-      avoidAreas: [],
-      notes: {},
-    };
-  }
-
-  private loadMemory(): void {
-    try {
-      if (!fs.existsSync(this.memoryPath)) {
-        this.memory = this.createEmptyMemory();
-        return;
-      }
-
-      const raw = JSON.parse(fs.readFileSync(this.memoryPath, 'utf8')) as Partial<AgentMemory>;
-      this.memory = {
-        ...this.createEmptyMemory(),
-        ...raw,
-        version: 1,
-        knownChests: Array.isArray(raw.knownChests) ? raw.knownChests : [],
-        knownResources: Array.isArray(raw.knownResources) ? raw.knownResources : [],
-        avoidAreas: Array.isArray(raw.avoidAreas) ? raw.avoidAreas : [],
-        notes: raw.notes && typeof raw.notes === 'object' ? raw.notes : {},
-      };
-      if (this.memory.home) {
-        this.homePosition = { x: this.memory.home.x, y: this.memory.home.y, z: this.memory.home.z };
-      }
-      this.notes = new Map(Object.entries(this.memory.notes));
-    } catch (err) {
-      this.log(`[agent] memory load failed: ${err instanceof Error ? err.message : String(err)}`);
-      this.memory = this.createEmptyMemory();
-    }
-  }
-
   private saveMemory(): void {
-    try {
-      this.memory.notes = Object.fromEntries(this.notes.entries());
-      fs.writeFileSync(this.memoryPath, JSON.stringify(this.memory, null, 2));
-    } catch (err) {
-      this.log(`[agent] memory save failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    this.memoryManager.saveMemory();
+  }
+
+  private get notes(): Map<string, string> {
+    return this.memoryManager.notes;
+  }
+
+  private get homePosition() {
+    return this.memoryManager.homePosition;
+  }
+  private set homePosition(val) {
+    this.memoryManager.homePosition = val;
   }
 
   private currentPosition(label?: string): StoredPosition | null {
@@ -1248,13 +1152,16 @@ export class MinecraftAgent {
   }
 
   private getMovements(): Movements {
-    if (!this.movements) this.movements = new Movements(this.bot);
+    if (!this.movements) {
+      this.movements = new Movements(this.bot);
+    }
     return this.movements;
   }
 
   private startProactiveHooks(): void {
+    this.stateMachine.start();
     const bot = this.bot;
-
+    
     bot.on('health', () => {
       try {
         const now = Date.now();
@@ -1420,8 +1327,8 @@ export class MinecraftAgent {
       const timeLabel = timeOfDay < 13000 ? 'day' : 'night';
 
       const xpLevel = (bot as any).experience?.level ?? 0;
-      if (sender && sender !== 'voice' && !this.memory.owner) {
-        this.memory.owner = sender;
+      if (sender && sender !== 'voice' && !this.memoryManager.memory.owner) {
+        this.memoryManager.memory.owner = sender;
         this.saveMemory();
       }
 
@@ -1452,8 +1359,8 @@ export class MinecraftAgent {
             `Time: ${timeLabel}`,
             `Defend: ${this.defendActive ? 'ON' : 'OFF'}`,
             `Home: ${this.homePosition ? `(${this.homePosition.x.toFixed(0)}, ${this.homePosition.y.toFixed(0)}, ${this.homePosition.z.toFixed(0)})` : 'not set'}`,
-            `Task: ${this.memory.activeTask ? `${this.memory.activeTask.goal} (${this.memory.activeTask.progress.length}/${this.memory.activeTask.plan.length})` : 'none'}`,
-            `Memory: chests ${this.memory.knownChests.length}, resources ${this.memory.knownResources.length}, avoid ${this.memory.avoidAreas.length}`,
+            `Task: ${this.memoryManager.memory.activeTask ? `${this.memoryManager.memory.activeTask.goal} (${this.memoryManager.memory.activeTask.progress.length}/${this.memoryManager.memory.activeTask.plan.length})` : 'none'}`,
+            `Memory: chests ${this.memoryManager.memory.knownChests.length}, resources ${this.memoryManager.memory.knownResources.length}, avoid ${this.memoryManager.memory.avoidAreas.length}`,
             `Armor: ${armorSummary}`,
             `Inv: ${slotsUsed}/36 — ${invSummary}`,
             `Nearby hostiles: ${hostileSummary}`,
@@ -1788,30 +1695,30 @@ export class MinecraftAgent {
   }
 
   private getMemorySummary(): string {
-    const task = this.memory.activeTask
-      ? `${this.memory.activeTask.goal}: plan=[${this.memory.activeTask.plan.join(' > ')}], progress=[${this.memory.activeTask.progress.join(' | ')}]`
+    const task = this.memoryManager.memory.activeTask
+      ? `${this.memoryManager.memory.activeTask.goal}: plan=[${this.memoryManager.memory.activeTask.plan.join(' > ')}], progress=[${this.memoryManager.memory.activeTask.progress.join(' | ')}]`
       : 'none';
-    const home = this.memory.home
-      ? `${this.memory.home.label ?? 'home'}@(${this.memory.home.x.toFixed(0)},${this.memory.home.y.toFixed(0)},${this.memory.home.z.toFixed(0)}) ${this.memory.home.dimension ?? ''}`.trim()
+    const home = this.memoryManager.memory.home
+      ? `${this.memoryManager.memory.home.label ?? 'home'}@(${this.memoryManager.memory.home.x.toFixed(0)},${this.memoryManager.memory.home.y.toFixed(0)},${this.memoryManager.memory.home.z.toFixed(0)}) ${this.memoryManager.memory.home.dimension ?? ''}`.trim()
       : 'not set';
     const locs = (positions: StoredPosition[]) => positions
       .slice(0, 10)
       .map(p => `${p.label ?? 'spot'}@(${p.x.toFixed(0)},${p.y.toFixed(0)},${p.z.toFixed(0)})`)
       .join('; ') || 'none';
-    const avoid = this.memory.avoidAreas
+    const avoid = this.memoryManager.memory.avoidAreas
       .slice(0, 10)
       .map(p => `${p.reason}@(${p.x.toFixed(0)},${p.y.toFixed(0)},${p.z.toFixed(0)})`)
       .join('; ') || 'none';
-    const notes = Object.entries({ ...this.memory.notes, ...Object.fromEntries(this.notes.entries()) })
+    const notes = Object.entries({ ...this.memoryManager.memory.notes, ...Object.fromEntries(this.notes.entries()) })
       .slice(0, 12)
       .map(([k, v]) => `${k}: ${v}`)
       .join('; ') || 'none';
 
     return [
-      `owner=${this.memory.owner ?? 'unknown'}`,
+      `owner=${this.memoryManager.memory.owner ?? 'unknown'}`,
       `home=${home}`,
-      `known_chests=${locs(this.memory.knownChests)}`,
-      `known_resources=${locs(this.memory.knownResources)}`,
+      `known_chests=${locs(this.memoryManager.memory.knownChests)}`,
+      `known_resources=${locs(this.memoryManager.memory.knownResources)}`,
       `avoid_areas=${avoid}`,
       `active_task=${task}`,
       `notes=${notes}`,
@@ -2327,7 +2234,7 @@ export class MinecraftAgent {
 
       case 'start_task': {
         const { goal, plan } = args as { goal: string; plan: string[] };
-        this.memory.activeTask = {
+        this.memoryManager.memory.activeTask = {
           goal,
           plan: Array.isArray(plan) ? plan.slice(0, 12) : [],
           progress: [],
@@ -2335,31 +2242,31 @@ export class MinecraftAgent {
           updatedAt: new Date().toISOString(),
         };
         this.saveMemory();
-        return `Started task "${goal}" with ${this.memory.activeTask.plan.length} step(s)`;
+        return `Started task "${goal}" with ${this.memoryManager.memory.activeTask.plan.length} step(s)`;
       }
 
       case 'update_task_progress': {
         const { progress } = args as { progress: string };
-        if (!this.memory.activeTask) return 'No active task to update';
-        this.memory.activeTask.progress.push(progress);
-        this.memory.activeTask.progress = this.memory.activeTask.progress.slice(-20);
-        this.memory.activeTask.updatedAt = new Date().toISOString();
+        if (!this.memoryManager.memory.activeTask) return 'No active task to update';
+        this.memoryManager.memory.activeTask.progress.push(progress);
+        this.memoryManager.memory.activeTask.progress = this.memoryManager.memory.activeTask.progress.slice(-20);
+        this.memoryManager.memory.activeTask.updatedAt = new Date().toISOString();
         this.saveMemory();
         return `Task progress saved: ${progress}`;
       }
 
       case 'complete_task': {
         const { summary } = args as { summary?: string };
-        const goal = this.memory.activeTask?.goal ?? 'task';
+        const goal = this.memoryManager.memory.activeTask?.goal ?? 'task';
         if (summary) this.notes.set(`completed_${Date.now()}`, `${goal}: ${summary}`);
-        this.memory.activeTask = undefined;
+        this.memoryManager.memory.activeTask = undefined;
         this.saveMemory();
         return summary ? `Completed ${goal}: ${summary}` : `Completed ${goal}`;
       }
 
       case 'get_current_task': {
-        if (!this.memory.activeTask) return 'No active task';
-        const task = this.memory.activeTask;
+        if (!this.memoryManager.memory.activeTask) return 'No active task';
+        const task = this.memoryManager.memory.activeTask;
         return `goal=${task.goal} | plan=${task.plan.join(' > ') || 'none'} | progress=${task.progress.join(' | ') || 'none'} | updated=${task.updatedAt}`;
       }
 
@@ -2378,17 +2285,17 @@ export class MinecraftAgent {
         };
         const position: StoredPosition = { x, y, z, dimension: bot.game.dimension, label };
         if (kind === 'home') {
-          this.memory.home = position;
+          this.memoryManager.memory.home = position;
           this.homePosition = { x, y, z };
         } else if (kind === 'chest') {
-          this.memory.knownChests.push(position);
-          this.memory.knownChests = this.memory.knownChests.slice(-30);
+          this.memoryManager.memory.knownChests.push(position);
+          this.memoryManager.memory.knownChests = this.memoryManager.memory.knownChests.slice(-30);
         } else if (kind === 'resource') {
-          this.memory.knownResources.push(position);
-          this.memory.knownResources = this.memory.knownResources.slice(-50);
+          this.memoryManager.memory.knownResources.push(position);
+          this.memoryManager.memory.knownResources = this.memoryManager.memory.knownResources.slice(-50);
         } else {
-          this.memory.avoidAreas.push({ ...position, reason: reason ?? label });
-          this.memory.avoidAreas = this.memory.avoidAreas.slice(-30);
+          this.memoryManager.memory.avoidAreas.push({ ...position, reason: reason ?? label });
+          this.memoryManager.memory.avoidAreas = this.memoryManager.memory.avoidAreas.slice(-30);
         }
         this.saveMemory();
         return `Remembered ${kind} ${label} at (${x}, ${y}, ${z})`;
@@ -2454,7 +2361,7 @@ export class MinecraftAgent {
 
       case 'deposit_inventory': {
         const { keep_tools_food_valuables = true } = args as { keep_tools_food_valuables?: boolean };
-        let chest = this.memory.knownChests
+        let chest = this.memoryManager.memory.knownChests
           .map(p => bot.blockAt(this.makeVec3(Math.floor(p.x), Math.floor(p.y), Math.floor(p.z))))
           .find(b => b && b.name !== 'air') ?? null;
         if (!chest) chest = this.findNearestBlockByNames(this.getContainerBlockNames(), 32);
@@ -2473,15 +2380,15 @@ export class MinecraftAgent {
         } finally {
           container.close();
         }
-        this.memory.knownChests.push({ x: chest.position.x, y: chest.position.y, z: chest.position.z, dimension: bot.game.dimension, label: chest.name });
-        this.memory.knownChests = this.memory.knownChests.slice(-30);
+        this.memoryManager.memory.knownChests.push({ x: chest.position.x, y: chest.position.y, z: chest.position.z, dimension: bot.game.dimension, label: chest.name });
+        this.memoryManager.memory.knownChests = this.memoryManager.memory.knownChests.slice(-30);
         this.saveMemory();
         return `Deposited ${deposited} stack(s) into ${chest.name} at (${chest.position.x}, ${chest.position.y}, ${chest.position.z})`;
       }
 
       case 'return_home': {
-        if (!this.homePosition && this.memory.home) {
-          this.homePosition = { x: this.memory.home.x, y: this.memory.home.y, z: this.memory.home.z };
+        if (!this.homePosition && this.memoryManager.memory.home) {
+          this.homePosition = { x: this.memoryManager.memory.home.x, y: this.memoryManager.memory.home.y, z: this.memoryManager.memory.home.z };
         }
         return this.executeTool('go_home', {});
       }
@@ -3213,14 +3120,14 @@ export class MinecraftAgent {
       case 'set_home': {
         const p = bot.entity.position;
         this.homePosition = { x: p.x, y: p.y, z: p.z };
-        this.memory.home = { x: p.x, y: p.y, z: p.z, dimension: bot.game.dimension, label: 'home' };
+        this.memoryManager.memory.home = { x: p.x, y: p.y, z: p.z, dimension: bot.game.dimension, label: 'home' };
         this.saveMemory();
         return `Home set at (${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)})`;
       }
 
       case 'go_home': {
-        if (!this.homePosition && this.memory.home) {
-          this.homePosition = { x: this.memory.home.x, y: this.memory.home.y, z: this.memory.home.z };
+        if (!this.homePosition && this.memoryManager.memory.home) {
+          this.homePosition = { x: this.memoryManager.memory.home.x, y: this.memoryManager.memory.home.y, z: this.memoryManager.memory.home.z };
         }
         if (!this.homePosition) return 'No home set — use set_home first';
         const { x, y, z } = this.homePosition;
