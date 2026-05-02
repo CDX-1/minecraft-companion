@@ -34,6 +34,7 @@
     "mineflayer-tool": "^1.2.0",
     "node-global-key-listener": "^0.3.0",
     "openai": "^6.35.0",
+    "pngjs": "^7.0.0",
     "prismarine-nbt": "^2.8.0",
     "serialport": "^13.0.0",
     "speaker": "^0.5.4"
@@ -42,6 +43,7 @@
     "@types/blessed": "^0.1.27",
     "@types/inquirer": "^8.2.12",
     "@types/node": "^25.6.0",
+    "@types/pngjs": "^6.0.5",
     "ts-node": "^10.9.2",
     "typescript": "^6.0.3"
   }

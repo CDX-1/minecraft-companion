@@ -24,4 +24,5 @@ export interface BotConfig {
   elevenLabsLatency: number;
   buildCrewEnabled: boolean;
   buildCrewSize: number;
+  skinUsername?: string;
 }

@@ -493,6 +493,12 @@ export function launchUI(config: BotConfig): void {
       void loadAutoEatSafely();
       void (bot as any).armorManager?.equipAll?.().catch?.(() => undefined);
 
+      if (config.skinUsername) {
+        const cmd = `/skin set ${config.skinUsername}`;
+        bot.chat(cmd);
+        logSystem(`Skin command sent: ${cmd}`);
+      }
+
       if (openaiApiKey) {
         agent = new MinecraftAgent(
           bot,

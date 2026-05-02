@@ -1,9 +1,94 @@
 import 'dotenv/config';
 import inquirer from 'inquirer';
+import readline from 'readline';
 import { parseIgnoredUsernames } from './chatFilter';
 import { AutonomyLevel, BotConfig } from './config';
 import { readOwnerUsernameFromMemory } from './ownerConfig';
 import { launchUI } from './ui';
+import { SKIN_USERNAMES, SkinUsername, fetchSkinArt, prefetchAllSkins } from './skin/skinPreview';
+
+// ── Skin chooser ─────────────────────────────────────────────────────────────
+
+const SKIN_WIDTH = 22;
+
+function clearLines(n: number) {
+  for (let i = 0; i < n; i++) {
+    process.stdout.write('\x1b[1A\x1b[2K');
+  }
+}
+
+async function chooseSkin(): Promise<SkinUsername | undefined> {
+  // Ask whether to pick a skin first
+  const { wantSkin } = await inquirer.prompt([
+    {
+      type: 'confirm',
+      name: 'wantSkin',
+      message: 'Choose a companion skin?',
+      default: true,
+    },
+  ]);
+  if (!wantSkin) return undefined;
+
+  // Fetch all skin art up-front (already cached from prefetch)
+  const arts: Record<string, string> = {};
+  for (const u of SKIN_USERNAMES) {
+    arts[u] = await fetchSkinArt(u, SKIN_WIDTH).catch(() => '(preview unavailable)');
+  }
+
+  let idx = 0;
+  let renderedLineCount = 0;
+
+  function renderPicker() {
+    if (renderedLineCount > 0) clearLines(renderedLineCount);
+
+    const username = SKIN_USERNAMES[idx];
+    const art = arts[username];
+    const artLines = art.split('\n');
+    const total = SKIN_USERNAMES.length;
+
+    const header = `  Skin ${idx + 1}/${total}: \x1b[1;36m${username}\x1b[0m  (← → to cycle, Enter to confirm)`;
+    const divider = '  ' + '─'.repeat(SKIN_WIDTH + 2);
+    const framedArt = artLines.map((l) => `  │ ${l} │`).join('\n');
+    const footer = `  └${'─'.repeat(SKIN_WIDTH + 2)}┘`;
+
+    const output = `${header}\n  ┌${'─'.repeat(SKIN_WIDTH + 2)}┐\n${framedArt}\n${footer}\n`;
+    process.stdout.write(output);
+    renderedLineCount = output.split('\n').length;
+  }
+
+  return new Promise<SkinUsername>((resolve) => {
+    renderPicker();
+
+    readline.emitKeypressEvents(process.stdin);
+    if (process.stdin.isTTY) process.stdin.setRawMode(true);
+
+    const onKey = (_: string, key: readline.Key) => {
+      if (!key) return;
+      if (key.name === 'right' || key.name === 'l') {
+        idx = (idx + 1) % SKIN_USERNAMES.length;
+        renderPicker();
+      } else if (key.name === 'left' || key.name === 'h') {
+        idx = (idx - 1 + SKIN_USERNAMES.length) % SKIN_USERNAMES.length;
+        renderPicker();
+      } else if (key.name === 'return' || key.name === 'enter') {
+        if (renderedLineCount > 0) clearLines(renderedLineCount);
+        if (process.stdin.isTTY) process.stdin.setRawMode(false);
+        process.stdin.removeListener('keypress', onKey);
+        process.stdin.pause();
+        const chosen = SKIN_USERNAMES[idx];
+        console.log(`  \x1b[32m✔\x1b[0m Skin selected: \x1b[1;36m${chosen}\x1b[0m`);
+        resolve(chosen);
+      } else if (key.name === 'c' && key.ctrl) {
+        process.exit(0);
+      }
+    };
+
+    process.stdin.on('keypress', onKey);
+    process.stdin.resume();
+  });
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
   console.clear();
@@ -14,6 +99,9 @@ async function main() {
   console.log('  ██║╚██╔╝██║██║          ');
   console.log('  ██║ ╚═╝ ██║╚██████╗     Configure link below');
   console.log('  ╚═╝     ╚═╝ ╚═════╝\n');
+
+  // Pre-fetch all skin images in background so they're ready when needed
+  void prefetchAllSkins(SKIN_WIDTH);
 
   const envElevenLabsEnabled = process.env.ELEVENLABS_ENABLED === 'true';
   const envElevenLabsApiKey = process.env.ELEVENLABS_API_KEY?.trim();
@@ -186,6 +274,8 @@ async function main() {
     },
   ]);
 
+  const skinUsername = await chooseSkin();
+
   const config: BotConfig = {
     ...answers,
     ownerUsername: process.env.MC_OWNER_USERNAME?.trim() || memoryOwnerUsername || answers.ownerUsername,
@@ -199,6 +289,7 @@ async function main() {
     elevenLabsLatency: envElevenLabsLatency,
     buildCrewEnabled: answers.buildCrewEnabled ?? envBuildCrewEnabled,
     buildCrewSize: Math.max(1, Math.min(8, Number(answers.buildCrewSize) || envBuildCrewSize)),
+    skinUsername,
   };
 
   launchUI(config);
