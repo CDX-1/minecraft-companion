@@ -524,7 +524,7 @@ export function launchUI(config: BotConfig): void {
     });
 
     bot.on('chat', (username, message) => {
-      if (shouldIgnoreChatSender(username, bot.username, config.ignoredUsernames)) {
+      if (shouldIgnoreChatSender(username, bot.username, config.ignoredUsernames, config.ownerUsername)) {
         chatLog.log(`{gray-fg}[ignored] <${username}> ${message}{/gray-fg}`);
         screen.render();
         return;

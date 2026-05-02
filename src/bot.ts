@@ -1,7 +1,9 @@
 import 'dotenv/config';
 import mineflayer, { Bot } from 'mineflayer';
 import { pathfinder, Movements, goals } from 'mineflayer-pathfinder';
+import { shouldIgnoreChatSender } from './chatFilter';
 import { parseChatCommand } from './commands';
+import { readOwnerUsernameFromMemory } from './ownerConfig';
 
 const bot: Bot = mineflayer.createBot({
   host: process.env.MC_HOST ?? 'localhost',
@@ -13,6 +15,7 @@ const bot: Bot = mineflayer.createBot({
 bot.loadPlugin(pathfinder);
 
 const FOLLOW_RANGE = 2;
+const ownerUsername = process.env.MC_OWNER_USERNAME?.trim() || readOwnerUsernameFromMemory();
 
 function followPlayer(username: string): void {
   const target = bot.players[username]?.entity;
@@ -33,6 +36,7 @@ bot.once('spawn', () => {
 
 bot.on('chat', (username, message) => {
   if (username === bot.username) return;
+  if (ownerUsername && shouldIgnoreChatSender(username, bot.username, [], ownerUsername)) return;
   console.log(`[chat] <${username}> ${message}`);
 
   const command = parseChatCommand(message, bot.username);

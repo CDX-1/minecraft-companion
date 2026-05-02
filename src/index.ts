@@ -2,6 +2,7 @@ import 'dotenv/config';
 import inquirer from 'inquirer';
 import { parseIgnoredUsernames } from './chatFilter';
 import { BotConfig } from './config';
+import { readOwnerUsernameFromMemory } from './ownerConfig';
 import { launchUI } from './ui';
 
 async function main() {
@@ -24,6 +25,7 @@ async function main() {
     ? process.env.ELEVENLABS_STREAMING === 'true'
     : true;
   const envElevenLabsLatency = Math.max(0, Math.min(4, Number(process.env.ELEVENLABS_LATENCY) || 4));
+  const memoryOwnerUsername = readOwnerUsernameFromMemory();
 
   const answers = await inquirer.prompt([
     {
@@ -43,6 +45,13 @@ async function main() {
       name: 'username',
       message: 'Username:',
       default: process.env.MC_USERNAME ?? 'companion',
+    },
+    {
+      type: 'input',
+      name: 'ownerUsername',
+      message: 'Your Minecraft username (owner-only chat filter):',
+      default: process.env.MC_OWNER_USERNAME ?? memoryOwnerUsername ?? '',
+      filter: (value: string) => value.trim() || undefined,
     },
     {
       type: 'list',
@@ -78,14 +87,6 @@ async function main() {
       name: 'voiceEnabled',
       message: 'Enable browser voice commands?',
       default: process.env.VOICE_ENABLED === 'true',
-    },
-    {
-      type: 'input',
-      name: 'ownerUsername',
-      message: 'Minecraft username for voice commands like "follow me":',
-      default: process.env.MC_OWNER_USERNAME ?? '',
-      when: (answers) => answers.voiceEnabled,
-      filter: (value: string) => value.trim() || undefined,
     },
     {
       type: 'number',
@@ -145,6 +146,7 @@ async function main() {
 
   const config: BotConfig = {
     ...answers,
+    ownerUsername: process.env.MC_OWNER_USERNAME?.trim() || memoryOwnerUsername || answers.ownerUsername,
     elevenLabsEnabled: envElevenLabsEnabled ? true : answers.elevenLabsEnabled ?? false,
     elevenLabsApiKey: envElevenLabsApiKey ?? answers.elevenLabsApiKey,
     elevenLabsVoiceId: envElevenLabsVoiceId ?? answers.elevenLabsVoiceId,
