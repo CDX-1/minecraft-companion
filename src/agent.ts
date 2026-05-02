@@ -3,6 +3,29 @@ import type { Bot } from 'mineflayer';
 import { Movements, goals } from 'mineflayer-pathfinder';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
 
+export type LlmProvider = 'openai' | 'gemini';
+
+export interface MinecraftAgentOptions {
+  provider: LlmProvider;
+  apiKey: string;
+  openaiModel?: string;
+  geminiModel?: string;
+}
+
+type GeminiPart = {
+  text?: string;
+  functionCall?: { name: string; args?: Record<string, unknown> };
+  functionResponse?: { name: string; response: Record<string, unknown> };
+  thoughtSignature?: string;
+};
+
+type GeminiContent = { role: 'user' | 'model'; parts: GeminiPart[] };
+
+type GeminiGenerateContentResponse = {
+  candidates?: Array<{ content?: GeminiContent }>;
+  error?: { message?: string };
+};
+
 const HOSTILE_MOBS = new Set([
   'zombie', 'skeleton', 'creeper', 'spider', 'cave_spider', 'witch',
   'blaze', 'ghast', 'slime', 'magma_cube', 'enderman', 'endermite',
@@ -561,9 +584,14 @@ const TOOLS: ChatCompletionTool[] = [
 ];
 
 export class MinecraftAgent {
-  private openai: OpenAI;
+  private openai: OpenAI | null = null;
+  private provider: LlmProvider;
+  private apiKey: string;
+  private openaiModel: string;
+  private geminiModel: string;
   private movements: Movements | null = null;
   private history: ChatCompletionMessageParam[] = [];
+  private geminiHistory: GeminiContent[] = [];
   private readonly HISTORY_LIMIT = 24;
   private homePosition: { x: number; y: number; z: number } | null = null;
   private defendActive = false;
@@ -578,11 +606,23 @@ export class MinecraftAgent {
 
   constructor(
     private bot: Bot,
-    apiKey: string,
+    options: string | MinecraftAgentOptions,
     private log: (msg: string) => void,
     onAutonomousMessage?: (msg: string) => void
   ) {
-    this.openai = new OpenAI({ apiKey });
+    const resolvedOptions: MinecraftAgentOptions = typeof options === 'string'
+      ? { provider: 'openai', apiKey: options }
+      : options;
+
+    this.provider = resolvedOptions.provider;
+    this.apiKey = resolvedOptions.apiKey;
+    this.openaiModel = resolvedOptions.openaiModel ?? 'gpt-4.1-mini';
+    this.geminiModel = resolvedOptions.geminiModel ?? 'gemini-3-flash-preview';
+
+    if (this.provider === 'openai') {
+      this.openai = new OpenAI({ apiKey: this.apiKey });
+    }
+
     this.onAutonomousMessage = onAutonomousMessage;
     if (onAutonomousMessage) this.startProactiveHooks();
   }
@@ -718,6 +758,12 @@ export class MinecraftAgent {
         ].join(' | ')
       : 'Not yet spawned';
 
+    if (this.provider === 'gemini') {
+      return this.handleGeminiMessage(message, sender, state);
+    }
+
+    if (!this.openai) throw new Error('OpenAI client is not configured');
+
     const messages: ChatCompletionMessageParam[] = [
       { role: 'system', content: `${SYSTEM_PROMPT}\n\nCurrent state: ${state}` },
       ...this.history,
@@ -727,7 +773,7 @@ export class MinecraftAgent {
     let iterations = 0;
     while (iterations++ < 16) {
       const response = await this.openai.chat.completions.create({
-        model: 'gpt-4.1-mini',
+        model: this.openaiModel,
         messages,
         tools: TOOLS,
         tool_choice: 'auto',
@@ -772,6 +818,100 @@ export class MinecraftAgent {
     const firstUser = raw.findIndex(m => m.role === 'user');
     this.history = firstUser >= 0 ? raw.slice(firstUser) : [];
     return "I got confused. Try again?";
+  }
+
+
+  private async handleGeminiMessage(message: string, sender: string, state: string): Promise<string> {
+    const contents: GeminiContent[] = [
+      ...this.geminiHistory,
+      { role: 'user', parts: [{ text: `${sender} says: "${message}"` }] },
+    ];
+
+    let iterations = 0;
+    while (iterations++ < 16) {
+      const response = await this.callGemini(contents, state);
+      const modelContent = response.candidates?.[0]?.content;
+      const parts = modelContent?.parts ?? [];
+
+      if (!parts.length) {
+        if (response.error?.message) throw new Error(response.error.message);
+        return '';
+      }
+
+      contents.push({ role: 'model', parts });
+      const functionCalls = parts
+        .map((part) => part.functionCall)
+        .filter((call): call is { name: string; args?: Record<string, unknown> } => Boolean(call));
+
+      if (!functionCalls.length) {
+        this.geminiHistory = this.trimGeminiHistory(contents);
+        return parts.map((part) => part.text ?? '').join('').trim();
+      }
+
+      for (const fn of functionCalls) {
+        let result: string;
+        try {
+          result = await this.executeTool(fn.name, fn.args ?? {});
+          this.log(`[agent] ${fn.name}(${JSON.stringify(fn.args ?? {})}) -> ${result}`);
+        } catch (err) {
+          result = `Error: ${err instanceof Error ? err.message : String(err)}`;
+          this.log(`[agent] ${fn.name} failed: ${result}`);
+        }
+
+        contents.push({
+          role: 'user',
+          parts: [{ functionResponse: { name: fn.name, response: { result } } }],
+        });
+      }
+    }
+
+    this.geminiHistory = this.trimGeminiHistory(contents);
+    return 'I got confused. Try again?';
+  }
+
+  private async callGemini(contents: GeminiContent[], state: string): Promise<GeminiGenerateContentResponse> {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${this.geminiModel}:generateContent`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-goog-api-key': this.apiKey,
+        },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: `${SYSTEM_PROMPT}\n\nCurrent state: ${state}` }] },
+          contents,
+          tools: [{ functionDeclarations: this.getGeminiFunctionDeclarations() }],
+          generationConfig: {
+            maxOutputTokens: 1024,
+            thinkingConfig: { thinkingLevel: 'low' },
+          },
+        }),
+      }
+    );
+
+    const payload = (await response.json()) as GeminiGenerateContentResponse;
+    if (!response.ok) {
+      throw new Error(payload.error?.message ?? `Gemini request failed with HTTP ${response.status}`);
+    }
+
+    return payload;
+  }
+
+  private getGeminiFunctionDeclarations() {
+    return TOOLS
+      .filter((tool): tool is ChatCompletionTool & { type: 'function' } => tool.type === 'function')
+      .map((tool) => ({
+        name: tool.function.name,
+        description: tool.function.description,
+        parameters: tool.function.parameters,
+      }));
+  }
+
+  private trimGeminiHistory(contents: GeminiContent[]): GeminiContent[] {
+    const trimmed = contents.slice(-this.HISTORY_LIMIT);
+    const firstUser = trimmed.findIndex((content) => content.role === 'user');
+    return firstUser >= 0 ? trimmed.slice(firstUser) : [];
   }
 
   private makeVec3(x: number, y: number, z: number) {

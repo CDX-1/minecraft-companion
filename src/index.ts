@@ -6,9 +6,13 @@ import { launchUI } from './ui';
 
 async function main() {
   console.clear();
-  console.log('╔══════════════════════════════╗');
-  console.log('║    Minecraft Companion TUI   ║');
-  console.log('╚══════════════════════════════╝\n');
+  console.log('');
+  console.log('  ███╗   ███╗ ██████╗     COMPANION');
+  console.log('  ████╗ ████║██╔════╝     Minecraft field console');
+  console.log('  ██╔████╔██║██║          Chat · voice · pathfinding · agent');
+  console.log('  ██║╚██╔╝██║██║          ');
+  console.log('  ██║ ╚═╝ ██║╚██████╗     Configure link below');
+  console.log('  ╚═╝     ╚═╝ ╚═════╝\n');
 
   const envElevenLabsEnabled = process.env.ELEVENLABS_ENABLED === 'true';
   const envElevenLabsApiKey = process.env.ELEVENLABS_API_KEY?.trim();

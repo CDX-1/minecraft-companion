@@ -11,31 +11,34 @@ import { startVoiceServer, VoiceServer } from './voiceServer';
 export function launchUI(config: BotConfig): void {
   const screen = blessed.screen({
     smartCSR: true,
-    title: 'Minecraft Companion',
+    title: 'MC Companion Command Deck',
     fullUnicode: true,
   });
 
-  // ── Status bar (top, 1 line) ──────────────────────────────
   const statusBar = blessed.box({
     top: 0,
     left: 0,
     width: '100%',
-    height: 1,
-    content: `  Connecting to ${config.host}:${config.port} as ${config.username}…`,
-    style: { bg: 'blue', fg: 'white', bold: true },
+    height: 3,
+    tags: true,
+    content:
+      ` {bold}MC COMPANION{/bold}  {gray-fg}target{/gray-fg} ${config.host}:${config.port}` +
+      `  {gray-fg}callsign{/gray-fg} ${config.username}` +
+      `  {yellow-fg}connecting{/yellow-fg}\n` +
+      ' {gray-fg}chat monitor · voice bridge · pathfinder · agent console{/gray-fg}',
+    style: { bg: 'black', fg: 'white', bold: true },
   });
 
-  // ── Chat log (left panel) ─────────────────────────────────
   const chatLog = blessed.log({
-    top: 1,
+    top: 3,
     left: 0,
     width: '70%',
-    bottom: 0,
-    label: ' Chat ',
+    bottom: 2,
+    label: ' TRANSMISSION LOG ',
     border: { type: 'line' },
     style: {
-      border: { fg: 'cyan' },
-      label: { fg: 'cyan', bold: true },
+      border: { fg: 'green' },
+      label: { fg: 'green', bold: true },
     },
     scrollable: true,
     alwaysScroll: true,
@@ -44,26 +47,43 @@ export function launchUI(config: BotConfig): void {
     padding: { left: 1, right: 1 },
   });
 
-  // ── Info panel (right panel) ──────────────────────────────
   const infoPanel = blessed.box({
-    top: 1,
+    top: 3,
     right: 0,
     width: '30%',
-    bottom: 0,
-    label: ' Info ',
+    bottom: 2,
+    label: ' TELEMETRY ',
     border: { type: 'line' },
     style: {
-      border: { fg: 'yellow' },
-      label: { fg: 'yellow', bold: true },
+      border: { fg: 'cyan' },
+      label: { fg: 'cyan', bold: true },
     },
     tags: true,
-    padding: { left: 1 },
-    content: '{gray-fg}Waiting for spawn…{/gray-fg}',
+    padding: { left: 1, right: 1 },
+    content:
+      '{gray-fg}Awaiting spawn telemetry...{/gray-fg}\n\n' +
+      `{bold}Agent{/bold}\n ${process.env.OPENAI_API_KEY?.trim() ? '{green-fg}armed{/green-fg}' : '{yellow-fg}basic commands{/yellow-fg}'}\n\n` +
+      `{bold}Voice{/bold}\n ${config.voiceEnabled ? '{magenta-fg}bridge requested{/magenta-fg}' : '{gray-fg}disabled{/gray-fg}'}`,
+  });
+
+  const footerBar = blessed.box({
+    bottom: 0,
+    left: 0,
+    width: '100%',
+    height: 2,
+    tags: true,
+    content:
+      ' {green-fg}CTRL+C{/green-fg} quit' +
+      '   {cyan-fg}chat{/cyan-fg} in Minecraft' +
+      '   {magenta-fg}voice{/magenta-fg} use logged local URL' +
+      '   {yellow-fg}ignored bots{/yellow-fg} ' + (config.ignoredUsernames.length ? config.ignoredUsernames.join(', ') : 'none'),
+    style: { bg: 'black', fg: 'white' },
   });
 
   screen.append(statusBar);
   screen.append(chatLog);
   screen.append(infoPanel);
+  screen.append(footerBar);
 
   let voiceServer: VoiceServer | null = null;
   let voiceSpeaker: ElevenLabsSpeaker | null = null;
@@ -81,12 +101,36 @@ export function launchUI(config: BotConfig): void {
   let bot: Bot;
   let infoTimer: NodeJS.Timeout | null = null;
 
+  function logSystem(message: string) {
+    chatLog.log(`{green-fg}[system]{/green-fg} ${message}`);
+    screen.render();
+  }
+
+  function logAgent(message: string) {
+    chatLog.log(`{gray-fg}[agent]{/gray-fg} ${message}`);
+    screen.render();
+  }
+
+  function logVoice(message: string) {
+    chatLog.log(`{magenta-fg}[voice]{/magenta-fg} ${message}`);
+    screen.render();
+  }
+
+  function logWarning(message: string) {
+    chatLog.log(`{yellow-fg}[warn]{/yellow-fg} ${message}`);
+    screen.render();
+  }
+
+  function logError(message: string) {
+    chatLog.log(`{red-fg}[error]{/red-fg} ${message}`);
+    screen.render();
+  }
+
   function setupElevenLabs() {
     if (!config.elevenLabsEnabled) return;
 
     if (!config.elevenLabsApiKey || !config.elevenLabsVoiceId) {
-      chatLog.log('{yellow-fg}[voice] ElevenLabs is enabled, but API key or voice ID is missing.{/yellow-fg}');
-      screen.render();
+      logWarning('ElevenLabs enabled, but API key or voice ID is missing.');
       return;
     }
 
@@ -101,14 +145,12 @@ export function launchUI(config: BotConfig): void {
         latency: config.elevenLabsLatency,
       },
       (message) => {
-        chatLog.log(`{red-fg}${message}{/red-fg}`);
-        screen.render();
+        logError(message);
       }
     );
 
     const mode = config.elevenLabsStreaming ? 'streaming' : 'buffered';
-    chatLog.log(`{magenta-fg}[voice] ElevenLabs voice synthesis enabled (${mode}).{/magenta-fg}`);
-    screen.render();
+    logVoice(`ElevenLabs synthesis enabled (${mode}).`);
   }
 
   function botSay(message: string) {
@@ -121,14 +163,12 @@ export function launchUI(config: BotConfig): void {
 
     if (!target) {
       botSay("I can't see you.");
-      chatLog.log(`{yellow-fg}[bot] Could not see ${username} to follow.{/yellow-fg}`);
-      screen.render();
+      logWarning(`Could not see ${username} to follow.`);
       return;
     }
 
     botSay('Following you.');
-    chatLog.log(`{green-fg}[bot] Following ${username}.{/green-fg}`);
-    screen.render();
+    logSystem(`Following ${username}.`);
 
     bot.pathfinder.setMovements(new Movements(bot));
     bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
@@ -141,11 +181,10 @@ export function launchUI(config: BotConfig): void {
       voiceServer = await startVoiceServer({
         port: config.voicePort,
         onTranscript: (text) => {
-          chatLog.log(`{magenta-fg}[voice]{/magenta-fg} ${text}`);
+          logVoice(text);
 
           if (!bot?.entity) {
-            chatLog.log('{yellow-fg}[voice] Bot not spawned; command ignored.{/yellow-fg}');
-            screen.render();
+            logWarning('Bot not spawned; voice command ignored.');
             return;
           }
 
@@ -155,8 +194,7 @@ export function launchUI(config: BotConfig): void {
               .handleMessage(text, sender)
               .then((response) => { if (response) botSay(response); })
               .catch((err: Error) => {
-                chatLog.log(`{red-fg}[agent] voice error: ${err.message}{/red-fg}`);
-                screen.render();
+                logError(`agent voice error: ${err.message}`);
               });
           } else {
             const command = parseChatCommand(text, bot.username);
@@ -166,7 +204,7 @@ export function launchUI(config: BotConfig): void {
             } else if (command === 'follow') {
               if (config.ownerUsername) followPlayer(config.ownerUsername);
             } else {
-              chatLog.log('{yellow-fg}[voice] No matching command.{/yellow-fg}');
+              logWarning('No matching voice command.');
             }
           }
 
@@ -174,12 +212,10 @@ export function launchUI(config: BotConfig): void {
         },
       });
 
-      chatLog.log(`{magenta-fg}[voice] Open ${voiceServer.url} in Chrome or Edge and allow microphone access.{/magenta-fg}`);
-      screen.render();
+      logVoice(`Manual launch only: ${voiceServer.url}`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      chatLog.log(`{red-fg}[voice] Failed to start voice server: ${message}{/red-fg}`);
-      screen.render();
+      logError(`Failed to start voice server: ${message}`);
     }
   }
 
@@ -189,11 +225,12 @@ export function launchUI(config: BotConfig): void {
     const food = bot.food ?? 0;
     const pos = bot.entity.position;
     infoPanel.setContent(
-      `{bold}Server{/bold}\n ${config.host}:${config.port}\n\n` +
-      `{bold}Player{/bold}\n ${bot.username}\n\n` +
-      `{bold}Health{/bold}\n {red-fg}♥ ${hp}/20{/red-fg}\n\n` +
-      `{bold}Food{/bold}\n {green-fg}${food}/20{/green-fg}\n\n` +
-      `{bold}Position{/bold}\n X ${pos.x.toFixed(1)}\n Y ${pos.y.toFixed(1)}\n Z ${pos.z.toFixed(1)}`
+      `{bold}Link{/bold}\n {green-fg}online{/green-fg} ${config.host}:${config.port}\n\n` +
+      `{bold}Callsign{/bold}\n ${bot.username}\n\n` +
+      `{bold}Vitals{/bold}\n {red-fg}HP ${hp}/20{/red-fg}\n {green-fg}Food ${food}/20{/green-fg}\n\n` +
+      `{bold}Coordinates{/bold}\n X ${pos.x.toFixed(1)}\n Y ${pos.y.toFixed(1)}\n Z ${pos.z.toFixed(1)}\n\n` +
+      `{bold}Agent{/bold}\n ${agent ? '{green-fg}online{/green-fg}' : '{yellow-fg}basic commands{/yellow-fg}'}\n\n` +
+      `{bold}Voice{/bold}\n ${voiceServer ? '{magenta-fg}listening page live{/magenta-fg}' : config.voiceEnabled ? '{yellow-fg}starting{/yellow-fg}' : '{gray-fg}disabled{/gray-fg}'}`
     );
     screen.render();
   }
@@ -209,23 +246,27 @@ export function launchUI(config: BotConfig): void {
     bot.loadPlugin(pathfinder);
 
     bot.once('spawn', () => {
-      statusBar.setContent(`  Connected · ${bot.username} @ ${config.host}:${config.port}`);
+      statusBar.setContent(
+        ` {bold}MC COMPANION{/bold}  {gray-fg}target{/gray-fg} ${config.host}:${config.port}` +
+        `  {gray-fg}callsign{/gray-fg} ${bot.username}` +
+        `  {green-fg}online{/green-fg}\n` +
+        ' {gray-fg}chat monitor · voice bridge · pathfinder · agent console{/gray-fg}'
+      );
       statusBar.style.bg = 'green';
-      chatLog.log(`{green-fg}[system] Spawned as ${bot.username}{/green-fg}`);
+      logSystem(`Spawned as ${bot.username}.`);
       infoTimer = setInterval(renderInfo, 1000);
 
       if (openaiApiKey) {
         agent = new MinecraftAgent(bot, openaiApiKey, (msg) => {
-          chatLog.log(`{gray-fg}${msg}{/gray-fg}`);
-          screen.render();
+          logAgent(msg);
         }, (msg) => {
-          chatLog.log(`{yellow-fg}[auto] ${msg}{/yellow-fg}`);
+          chatLog.log(`{yellow-fg}[auto]{/yellow-fg} ${msg}`);
           botSay(msg);
           screen.render();
         });
-        chatLog.log(`{green-fg}[agent] GPT-4o-mini agent ready{/green-fg}`);
+        logAgent('GPT-4o-mini ready.');
       } else {
-        chatLog.log(`{yellow-fg}[agent] No OPENAI_API_KEY — using basic commands only{/yellow-fg}`);
+        logWarning('No OPENAI_API_KEY; using basic commands only.');
       }
 
       screen.render();
@@ -252,8 +293,7 @@ export function launchUI(config: BotConfig): void {
         return;
       }
 
-      chatLog.log(`{gray-fg}[agent] thinking…{/gray-fg}`);
-      screen.render();
+      logAgent('thinking...');
 
       agent
         .handleMessage(message, username)
@@ -261,13 +301,12 @@ export function launchUI(config: BotConfig): void {
           if (response) botSay(response);
         })
         .catch((err: Error) => {
-          chatLog.log(`{red-fg}[agent] error: ${err.message}{/red-fg}`);
-          screen.render();
+          logError(`agent error: ${err.message}`);
         });
     });
 
     bot.on('error', (err) => {
-      chatLog.log(`{red-fg}[error] ${err.message}{/red-fg}`);
+      logError(err.message);
       statusBar.setContent(`  Error: ${err.message}`);
       statusBar.style.bg = 'red';
       screen.render();
@@ -276,7 +315,7 @@ export function launchUI(config: BotConfig): void {
     bot.on('end', (reason) => {
       if (infoTimer) clearInterval(infoTimer);
       voiceServer?.close();
-      chatLog.log(`{yellow-fg}[system] Disconnected: ${reason}{/yellow-fg}`);
+      logWarning(`Disconnected: ${reason}`);
       statusBar.setContent(`  Disconnected: ${reason}`);
       statusBar.style.bg = 'red';
       screen.render();
