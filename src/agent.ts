@@ -1142,6 +1142,7 @@ export class MinecraftAgent {
   private homePosition: { x: number; y: number; z: number } | null = null;
   private navigationSeq = 0;
   private activeNavigationGoal: NavigationGoal | null = null;
+  private activeNavigationAbort: ((reason?: string) => void) | null = null;
   private activeFollowGoal: FollowGoal | null = null;
   private defendActive = false;
   private defendTick: (() => void) | null = null;
@@ -1328,6 +1329,7 @@ export class MinecraftAgent {
     if (this.activeFollowGoal) {
       const target = bot.players[this.activeFollowGoal.username]?.entity;
       if (!target) return;
+      bot.clearControlStates();
       bot.pathfinder.setMovements(this.getMovements());
       bot.pathfinder.setGoal(new goals.GoalFollow(target, this.activeFollowGoal.range), true);
       return;
@@ -1339,6 +1341,7 @@ export class MinecraftAgent {
     if (distance <= goal.range + 0.5) return;
 
     this.log(`[agent] recovering navigation to (${goal.x.toFixed(0)}, ${goal.y.toFixed(0)}, ${goal.z.toFixed(0)})`);
+    bot.clearControlStates();
     bot.pathfinder.setMovements(this.getMovements());
     bot.pathfinder.setGoal(new goals.GoalNear(goal.x, goal.y, goal.z, goal.range));
   }
@@ -1350,7 +1353,7 @@ export class MinecraftAgent {
     if (/\b(follow me|follow|come with me)\b/.test(lower)) {
       const target = this.bot.players[sender]?.entity;
       if (!target) return FAST_PATH_RESPONSES.cantSeeYou[p];
-      this.activeNavigationGoal = null;
+      this.interruptActiveNavigation('Navigation replaced by follow command');
       this.activeFollowGoal = { username: sender, range: 2 };
       this.bot.pathfinder.setMovements(this.getMovements());
       this.bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
@@ -1358,7 +1361,7 @@ export class MinecraftAgent {
     }
 
     if (/\b(stop|halt|stay|wait here)\b/.test(lower)) {
-      this.activeNavigationGoal = null;
+      this.interruptActiveNavigation('Navigation stopped by command');
       this.activeFollowGoal = null;
       this.bot.pathfinder.stop();
       this.bot.clearControlStates();
@@ -1382,6 +1385,9 @@ export class MinecraftAgent {
   }
 
   async handleMessage(message: string, sender: string): Promise<string> {
+    const fast = this.tryFastPath(message, sender);
+    if (fast !== null) return fast;
+
     if (this.isThinking) {
       const p = this.personality;
       if (p === 'tsundere') return "H-hey! I'm busy! Wait your turn!";
@@ -1393,9 +1399,6 @@ export class MinecraftAgent {
     this.isThinking = true;
     try {
       this.currentSender = sender;
-      const fast = this.tryFastPath(message, sender);
-      if (fast !== null) return fast;
-
       if (looksLikeBuildIntent(message)) {
         this.currentSender = sender;
         const lines = BUILD_VOICELINES[this.personality];
@@ -2291,6 +2294,7 @@ export class MinecraftAgent {
   private navigateTo(x: number, y: number, z: number, range = 1, timeoutMs = 60000): Promise<void> {
     const bot = this.bot;
     return new Promise((resolve, reject) => {
+      this.interruptActiveNavigation('Navigation replaced');
       const navId = ++this.navigationSeq;
       this.activeFollowGoal = null;
       this.activeNavigationGoal = { id: navId, x, y, z, range };
@@ -2301,6 +2305,7 @@ export class MinecraftAgent {
         bot.removeListener('goal_reached', onReached);
         bot.removeListener('path_update', onPathUpdate);
         if (this.activeNavigationGoal?.id === navId) this.activeNavigationGoal = null;
+        if (this.activeNavigationAbort === abort) this.activeNavigationAbort = null;
       };
 
       const timeoutId = setTimeout(() => {
@@ -2322,10 +2327,26 @@ export class MinecraftAgent {
         }
       };
 
+      const abort = (reason = 'Navigation interrupted') => {
+        cleanup();
+        bot.pathfinder.stop();
+        reject(new Error(reason));
+      };
+
+      this.activeNavigationAbort = abort;
       bot.once('goal_reached', onReached);
       bot.on('path_update', onPathUpdate);
       bot.pathfinder.setGoal(new goals.GoalNear(x, y, z, range));
     });
+  }
+
+  private interruptActiveNavigation(reason = 'Navigation interrupted'): void {
+    const abort = this.activeNavigationAbort;
+    if (abort) {
+      abort(reason);
+      return;
+    }
+    this.activeNavigationGoal = null;
   }
 
   private async executeTool(name: string, args: Record<string, unknown>): Promise<string> {
@@ -2606,7 +2627,7 @@ export class MinecraftAgent {
         const { username, range = 2 } = args as { username: string; range?: number };
         const target = bot.players[username]?.entity;
         if (!target) return `Cannot see player: ${username}`;
-        this.activeNavigationGoal = null;
+        this.interruptActiveNavigation('Navigation replaced by follow_player');
         this.activeFollowGoal = { username, range: range as number };
         bot.pathfinder.setMovements(this.getMovements());
         bot.pathfinder.setGoal(new goals.GoalFollow(target, range as number), true);
@@ -2614,7 +2635,7 @@ export class MinecraftAgent {
       }
 
       case 'stop_moving': {
-        this.activeNavigationGoal = null;
+        this.interruptActiveNavigation('Navigation stopped by stop_moving');
         this.activeFollowGoal = null;
         bot.pathfinder.stop();
         bot.clearControlStates();
@@ -2806,7 +2827,7 @@ export class MinecraftAgent {
           return dist <= (max_distance as number) && label.includes(entity_name.toLowerCase());
         });
         if (!target) return `No ${entity_name} found within ${max_distance} blocks`;
-        this.activeNavigationGoal = null;
+        this.interruptActiveNavigation('Navigation replaced by attack_entity');
         this.activeFollowGoal = null;
         const dist = bot.entity.position.distanceTo(target.position);
         if (dist > 3) await this.navigateTo(target.position.x, target.position.y, target.position.z, 2, 15000);
@@ -2824,7 +2845,7 @@ export class MinecraftAgent {
           return dist <= (max_distance as number) && label.includes(entity_name.toLowerCase());
         });
         if (!target) return `No ${entity_name} found within ${max_distance} blocks`;
-        this.activeNavigationGoal = null;
+        this.interruptActiveNavigation('Navigation replaced by kill_entity');
         this.activeFollowGoal = null;
 
         const weapons = bot.inventory.items().filter(i => i.name.includes('sword') || i.name.includes('axe'));
