@@ -1,4 +1,6 @@
 import OpenAI from 'openai';
+import fs from 'node:fs';
+import path from 'node:path';
 import type { Bot } from 'mineflayer';
 import { Movements, goals } from 'mineflayer-pathfinder';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
@@ -26,6 +28,20 @@ type GeminiGenerateContentResponse = {
   error?: { message?: string };
 };
 
+type StoredPosition = { x: number; y: number; z: number; dimension?: string; label?: string };
+type ActiveTask = { goal: string; plan: string[]; progress: string[]; startedAt: string; updatedAt: string };
+
+type AgentMemory = {
+  version: 1;
+  owner?: string;
+  home?: StoredPosition;
+  knownChests: StoredPosition[];
+  knownResources: StoredPosition[];
+  avoidAreas: Array<StoredPosition & { reason: string }>;
+  notes: Record<string, string>;
+  activeTask?: ActiveTask;
+};
+
 const HOSTILE_MOBS = new Set([
   'zombie', 'skeleton', 'creeper', 'spider', 'cave_spider', 'witch',
   'blaze', 'ghast', 'slime', 'magma_cube', 'enderman', 'endermite',
@@ -39,12 +55,20 @@ const SYSTEM_PROMPT = `You are an intelligent, proactive Minecraft bot. You have
 
 REASONING APPROACH:
 Before acting, silently reason: what do I need? do I have it? if not, where do I get it? then execute step by step.
+- For multi-step requests, call start_task with a short checklist, then update_task_progress as you work.
+- Prefer high-level skills (prepare_for_mining, gather_wood, craft_pickaxe, deposit_inventory, escape_danger) over low-level micromanagement.
 
 SITUATIONAL AWARENESS — always check before concluding you can't do something:
+- Start ambiguous tasks with scan_surroundings to understand players, mobs, blocks, chests, drops, and hazards.
+- Use check_danger before cave travel, combat, mining, night travel, lava areas, or low-health situations.
+- Use get_equipment_status before combat, mining, or dangerous travel.
+- Use inventory_summary, can_craft, and missing_materials_for before crafting or gathering.
+- Use get_best_tool_for_block before deciding what to mine or craft next.
 - Need an item? Check inventory (find_item) first. Not there? Search the world (find_blocks), navigate, and collect it.
 - Need to craft? Verify ingredients with find_item. Missing any? Gather them first, then craft.
 - Need to go somewhere? Use find_blocks or find_entities to locate it, then move_to.
 - Blocked or stuck? Try an alternate path, dig through, or find another route.
+- Remember important discoveries using remember_location/write_note and read_memory/read_notes later.
 
 EXECUTION RULES:
 - Tool calls execute ONE AT A TIME in sequence — plan your chain upfront, then fire each step
@@ -63,14 +87,16 @@ GOOD responses: "on it!", "grabbed some wood, making a pickaxe now", "done! foun
 BAD responses: "Executing navigation protocol", "Task completed successfully", "Initiating pathfinding sequence", "I have located the resources and will now proceed"
 
 TOOL SELECTION GUIDE:
+- Goal tracking: start_task -> act -> update_task_progress -> complete_task
 - Collecting blocks: break_and_collect gets the drop; dig_block just digs (use when drop doesn't matter)
 - Mining safety: break_and_collect uses Mineflayer's registry to equip valid tools and refuse unsafe harvests
 - Combat: kill_entity fights until dead; attack_entity is one hit (use for tagging or finishing)
+- Danger: check_danger gives an immediate risk report; escape_danger moves away from threats/lava when possible
 - Hostile areas: turn defend_self ON before exploring caves/nether, OFF when done
-- Chests: inspect_chest to see contents first, then deposit_to_chest or withdraw_from_chest
+- Chests: use find_nearest_chest first if no chest coordinates are known, then inspect_chest/deposit_to_chest/withdraw_from_chest; known chests persist in memory
 - Hunger: eat when food drops below 15/20; do it proactively before long tasks
 - Consumables / special items: use_item for potions, ender pearls, fishing rod, flint and steel, bone meal
-- Home: set_home at your base once, go_home to return from anywhere
+- Home: set_home at your base once, go_home/return_home to return from anywhere
 - Smelting: smelt_item handles the whole process — fuel, waiting, output
 - Notes: use write_note to record finds (coords, chest contents, resource spots) and read_notes to recall them
 - Inventory pressure: if Inv shows 32+/36 slots used, warn the player and suggest depositing to a nearby chest
@@ -81,6 +107,288 @@ CHAT RULES:
 - Only reply once at the end, never narrate each step`;
 
 const TOOLS: ChatCompletionTool[] = [
+
+  {
+    type: 'function',
+    function: {
+      name: 'start_task',
+      description: 'Start or replace the active multi-step task with a compact plan/checklist. Use this for broad goals before executing.',
+      parameters: {
+        type: 'object',
+        required: ['goal', 'plan'],
+        properties: {
+          goal: { type: 'string', description: 'Short goal name, e.g. collect iron, build shelter, prepare for mining.' },
+          plan: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Ordered checklist of planned steps.',
+          },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'update_task_progress',
+      description: 'Record progress on the active task so the bot can pause/resume instead of forgetting what it was doing.',
+      parameters: {
+        type: 'object',
+        required: ['progress'],
+        properties: {
+          progress: { type: 'string', description: 'Short progress note.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'complete_task',
+      description: 'Mark the active task done and clear it from memory.',
+      parameters: {
+        type: 'object',
+        properties: {
+          summary: { type: 'string', description: 'Optional short completion summary.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_current_task',
+      description: 'Read the current active task and its recorded progress.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_memory',
+      description: 'Read persistent bot memory: owner, home, known chests/resources, avoid areas, notes, and active task.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'remember_location',
+      description: 'Persist a useful location such as home, chest, resource, or danger area.',
+      parameters: {
+        type: 'object',
+        required: ['kind', 'label', 'x', 'y', 'z'],
+        properties: {
+          kind: { type: 'string', enum: ['home', 'chest', 'resource', 'avoid'] },
+          label: { type: 'string' },
+          x: { type: 'number' },
+          y: { type: 'number' },
+          z: { type: 'number' },
+          reason: { type: 'string', description: 'Required for avoid areas; optional otherwise.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'inventory_summary',
+      description: 'Summarize inventory by useful categories: blocks, wood, ores, ingots, tools, weapons, armor, food, fuel, valuables, and free slots.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'can_craft',
+      description: 'Check if the bot can craft an item now, considering nearby crafting tables for 3x3 recipes.',
+      parameters: {
+        type: 'object',
+        required: ['item_name'],
+        properties: {
+          item_name: { type: 'string' },
+          count: { type: 'number', description: 'Desired count, default 1.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'missing_materials_for',
+      description: 'Explain which materials are missing for crafting an item, based on Mineflayer recipe data.',
+      parameters: {
+        type: 'object',
+        required: ['item_name'],
+        properties: {
+          item_name: { type: 'string' },
+          count: { type: 'number', description: 'Desired count, default 1.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'check_danger',
+      description: 'Analyze immediate dangers: low health/food, hostile mobs, lava/fire/cactus, fall risk, drowning, night, and bad equipment.',
+      parameters: {
+        type: 'object',
+        properties: {
+          radius: { type: 'number', description: 'Danger scan radius in blocks (default 12, max 24).' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'escape_danger',
+      description: 'Try to move away from immediate threats/lava and eat if needed. Use when check_danger reports serious danger.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'prepare_for_mining',
+      description: 'High-level skill: check danger/equipment, eat, equip armor, ensure at least a usable pickaxe or explain missing materials.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'gather_wood',
+      description: 'High-level skill: find and collect nearby logs up to the requested count using collect-block/pathfinder.',
+      parameters: {
+        type: 'object',
+        properties: {
+          count: { type: 'number', description: 'Target number of logs to collect, default 8.' },
+          max_distance: { type: 'number', description: 'Search radius, default 48, max 64.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'craft_pickaxe',
+      description: 'High-level skill: craft the best currently reasonable pickaxe, crafting planks/sticks/table first when possible.',
+      parameters: {
+        type: 'object',
+        properties: {
+          material: { type: 'string', enum: ['wooden', 'stone', 'iron', 'diamond'], description: 'Preferred pickaxe material, default stone if possible.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'deposit_inventory',
+      description: 'High-level skill: find a nearby known/visible chest and deposit low-priority inventory items to free space.',
+      parameters: {
+        type: 'object',
+        properties: {
+          keep_tools_food_valuables: { type: 'boolean', description: 'Keep tools, weapons, armor, food, ores/ingots/diamonds. Default true.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'return_home',
+      description: 'High-level skill: return to persisted home memory. Same destination as go_home but uses persistent memory too.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'collect_food',
+      description: 'High-level skill: collect nearby dropped food or hunt nearby passive animals when food is low.',
+      parameters: {
+        type: 'object',
+        properties: {
+          target_count: { type: 'number', description: 'Desired food items, default 4.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'scan_surroundings',
+      description: 'Get a compact world-awareness scan: position, biome/weather, nearby players, hostiles, animals, dropped items, containers, important blocks/resources, health, food, and equipment.',
+      parameters: {
+        type: 'object',
+        properties: {
+          radius: { type: 'number', description: 'Scan radius in blocks (default 16, max 32)' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_equipment_status',
+      description: 'Summarize held item, armor, weapons, tools, food, arrows, shield, inventory pressure, and readiness for mining/combat.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_best_tool_for_block',
+      description: 'Use Mineflayer registry data to determine the best available inventory tool for a block and whether the bot can harvest it safely.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_name: { type: 'string', description: 'Block name such as diamond_ore, oak_log, dirt. Optional if x/y/z is provided.' },
+          x: { type: 'number' },
+          y: { type: 'number' },
+          z: { type: 'number' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'find_nearest_chest',
+      description: 'Find the nearest visible chest-like container and return coordinates, distance, and block type.',
+      parameters: {
+        type: 'object',
+        properties: {
+          max_distance: { type: 'number', description: 'Search radius in blocks (default 32, max 64)' },
+        },
+      },
+    },
+  },
+
+  {
+    type: 'function',
+    function: {
+      name: 'equip_best_armor',
+      description: 'Equip the best armor from inventory using armor-manager when available, then report equipment status.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'find_nearby_resources',
+      description: 'Find useful nearby resource blocks like logs, ores, coal, iron, crafting tables, furnaces, beds, and containers.',
+      parameters: {
+        type: 'object',
+        properties: {
+          max_distance: { type: 'number', description: 'Search radius in blocks (default 32, max 64)' },
+        },
+      },
+    },
+  },
   {
     type: 'function',
     function: {
@@ -594,6 +902,8 @@ export class MinecraftAgent {
   private history: ChatCompletionMessageParam[] = [];
   private geminiHistory: GeminiContent[] = [];
   private readonly HISTORY_LIMIT = 24;
+  private readonly memoryPath = path.join(process.cwd(), '.minecraft-companion-memory.json');
+  private memory: AgentMemory = this.createEmptyMemory();
   private homePosition: { x: number; y: number; z: number } | null = null;
   private defendActive = false;
   private defendTick: (() => void) | null = null;
@@ -624,8 +934,61 @@ export class MinecraftAgent {
       this.openai = new OpenAI({ apiKey: this.apiKey });
     }
 
+    this.loadMemory();
     this.onAutonomousMessage = onAutonomousMessage;
     if (onAutonomousMessage) this.startProactiveHooks();
+  }
+
+  private createEmptyMemory(): AgentMemory {
+    return {
+      version: 1,
+      knownChests: [],
+      knownResources: [],
+      avoidAreas: [],
+      notes: {},
+    };
+  }
+
+  private loadMemory(): void {
+    try {
+      if (!fs.existsSync(this.memoryPath)) {
+        this.memory = this.createEmptyMemory();
+        return;
+      }
+
+      const raw = JSON.parse(fs.readFileSync(this.memoryPath, 'utf8')) as Partial<AgentMemory>;
+      this.memory = {
+        ...this.createEmptyMemory(),
+        ...raw,
+        version: 1,
+        knownChests: Array.isArray(raw.knownChests) ? raw.knownChests : [],
+        knownResources: Array.isArray(raw.knownResources) ? raw.knownResources : [],
+        avoidAreas: Array.isArray(raw.avoidAreas) ? raw.avoidAreas : [],
+        notes: raw.notes && typeof raw.notes === 'object' ? raw.notes : {},
+      };
+      if (this.memory.home) {
+        this.homePosition = { x: this.memory.home.x, y: this.memory.home.y, z: this.memory.home.z };
+      }
+      this.notes = new Map(Object.entries(this.memory.notes));
+    } catch (err) {
+      this.log(`[agent] memory load failed: ${err instanceof Error ? err.message : String(err)}`);
+      this.memory = this.createEmptyMemory();
+    }
+  }
+
+  private saveMemory(): void {
+    try {
+      this.memory.notes = Object.fromEntries(this.notes.entries());
+      fs.writeFileSync(this.memoryPath, JSON.stringify(this.memory, null, 2));
+    } catch (err) {
+      this.log(`[agent] memory save failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private currentPosition(label?: string): StoredPosition | null {
+    if (!this.bot.entity) return null;
+    const p = this.bot.entity.position;
+    return { x: p.x, y: p.y, z: p.z, dimension: this.bot.game.dimension, label };
   }
 
   private getMovements(): Movements {
@@ -725,6 +1088,10 @@ export class MinecraftAgent {
     const timeLabel = timeOfDay < 13000 ? 'day' : 'night';
 
     const xpLevel = (bot as any).experience?.level ?? 0;
+    if (sender && sender !== 'voice' && !this.memory.owner) {
+      this.memory.owner = sender;
+      this.saveMemory();
+    }
 
     const armorItems = [5, 6, 7, 8]
       .map(i => (bot.inventory.slots as any[])[i])
@@ -753,6 +1120,8 @@ export class MinecraftAgent {
           `Time: ${timeLabel}`,
           `Defend: ${this.defendActive ? 'ON' : 'OFF'}`,
           `Home: ${this.homePosition ? `(${this.homePosition.x.toFixed(0)}, ${this.homePosition.y.toFixed(0)}, ${this.homePosition.z.toFixed(0)})` : 'not set'}`,
+          `Task: ${this.memory.activeTask ? `${this.memory.activeTask.goal} (${this.memory.activeTask.progress.length}/${this.memory.activeTask.plan.length})` : 'none'}`,
+          `Memory: chests ${this.memory.knownChests.length}, resources ${this.memory.knownResources.length}, avoid ${this.memory.avoidAreas.length}`,
           `Armor: ${armorSummary}`,
           `Inv: ${slotsUsed}/36 — ${invSummary}`,
           `Nearby hostiles: ${hostileSummary}`,
@@ -963,6 +1332,392 @@ export class MinecraftAgent {
     return 0;
   }
 
+
+  private getDistanceTo(position: { x: number; y: number; z: number }): string {
+    if (!this.bot.entity) return '?';
+    return this.bot.entity.position.distanceTo(position as any).toFixed(0);
+  }
+
+  private getContainerBlockNames(): string[] {
+    return ['chest', 'trapped_chest', 'barrel', 'shulker_box', 'ender_chest'];
+  }
+
+  private findNearestBlockByNames(blockNames: string[], maxDistance: number) {
+    const ids = blockNames.flatMap((name) => {
+      const exact = this.bot.registry.blocksByName[name]?.id;
+      if (exact) return [exact];
+      return Object.values(this.bot.registry.blocksByName)
+        .filter((block) => block.name === name || block.name.endsWith(`_${name}`))
+        .map((block) => block.id);
+    });
+
+    if (!ids.length) return null;
+    const positions = this.bot.findBlocks({ matching: ids, maxDistance, count: 1 });
+    if (!positions.length) return null;
+    return this.bot.blockAt(positions[0]);
+  }
+
+  private listNearestBlocksByNames(blockNames: string[], maxDistance: number, count = 8): string[] {
+    const ids = blockNames.flatMap((name) => {
+      const exact = this.bot.registry.blocksByName[name]?.id;
+      if (exact) return [exact];
+      return Object.values(this.bot.registry.blocksByName)
+        .filter((block) => block.name === name || block.name.endsWith(`_${name}`))
+        .map((block) => block.id);
+    });
+
+    if (!ids.length || !this.bot.entity) return [];
+    const positions = this.bot.findBlocks({ matching: ids, maxDistance, count });
+    return positions.map((pos) => {
+      const block = this.bot.blockAt(pos);
+      const distance = this.bot.entity!.position.distanceTo(pos).toFixed(0);
+      return `${block?.name ?? 'unknown'}@(${pos.x},${pos.y},${pos.z}) ${distance}m`;
+    });
+  }
+
+  private getEquipmentSummary(): string {
+    const items = this.bot.inventory.items();
+    const held = (this.bot.heldItem as any)?.name ?? 'empty';
+    const slots = this.bot.inventory.slots as any[];
+    const armor = [
+      ['head', slots[5]?.name ?? 'empty'],
+      ['torso', slots[6]?.name ?? 'empty'],
+      ['legs', slots[7]?.name ?? 'empty'],
+      ['feet', slots[8]?.name ?? 'empty'],
+    ].map(([slot, item]) => `${slot}:${item}`).join(', ');
+    const weapons = items.filter(i => i.name.includes('sword') || i.name.endsWith('_axe')).map(i => `${i.name}x${i.count}`);
+    const tools = items.filter(i => /_(pickaxe|axe|shovel|hoe)$/.test(i.name) || i.name === 'shears').map(i => `${i.name}x${i.count}`);
+    const foodNames = new Set(Object.keys((this.bot.registry as any).foodsByName ?? {}));
+    const foods = items.filter(i => foodNames.has(i.name)).map(i => `${i.name}x${i.count}`);
+    const arrows = items.find(i => i.name === 'arrow')?.count ?? 0;
+    const shield = items.some(i => i.name === 'shield') || held === 'shield' ? 'yes' : 'no';
+    return [
+      `held=${held}`,
+      `armor=[${armor}]`,
+      `weapons=${weapons.join(', ') || 'none'}`,
+      `tools=${tools.join(', ') || 'none'}`,
+      `food=${foods.join(', ') || 'none'}`,
+      `arrows=${arrows}`,
+      `shield=${shield}`,
+      `inventory=${items.length}/36 slots`,
+    ].join(' | ');
+  }
+
+  private getBestToolReportForBlock(block: NonNullable<ReturnType<Bot['blockAt']>>): string {
+    const bestTool = this.chooseBestRegistryHarvestTool(block);
+    const required = block.harvestTools ? this.summarizeRegistryHarvestRequirement(block) : 'no required harvest tool';
+    const preferred = this.choosePreferredRegistryTool(block);
+    const drops = ((block.drops ?? []) as any[])
+      .map(drop => typeof drop === 'number' ? drop : drop?.drop?.id ?? drop?.drop)
+      .map(id => this.bot.registry.items[id]?.name)
+      .filter(Boolean)
+      .join(', ') || 'none/unknown';
+    return [
+      `block=${block.name}`,
+      `material=${block.material ?? 'unknown'}`,
+      `diggable=${block.diggable}`,
+      `hardness=${block.hardness}`,
+      `drops=${drops}`,
+      `required=${required}`,
+      `best_available=${bestTool?.name ?? 'none'}`,
+      `preferred_available=${preferred?.name ?? 'none'}`,
+      `can_dig_now=${this.bot.canDigBlock(block)}`,
+    ].join(' | ');
+  }
+
+  private getEntityScan(radius: number): { players: string[]; hostiles: string[]; animals: string[]; drops: string[] } {
+    const players: string[] = [];
+    const hostiles: string[] = [];
+    const animals: string[] = [];
+    const drops: string[] = [];
+    if (!this.bot.entity) return { players, hostiles, animals, drops };
+
+    for (const entity of Object.values(this.bot.entities)) {
+      if (entity === this.bot.entity) continue;
+      const distance = this.bot.entity.position.distanceTo(entity.position);
+      if (distance > radius) continue;
+      const label = entity.username ?? entity.displayName ?? entity.name ?? entity.type ?? 'unknown';
+      const entry = `${label} ${distance.toFixed(0)}m`;
+      if (entity.username) players.push(entry);
+      else if (entity.name === 'item') drops.push(entry);
+      else if (HOSTILE_MOBS.has(entity.name?.toLowerCase() ?? '') || entity.type === 'hostile') hostiles.push(entry);
+      else if (entity.type === 'mob' || entity.type === 'other') animals.push(entry);
+    }
+
+    return {
+      players: players.slice(0, 8),
+      hostiles: hostiles.slice(0, 8),
+      animals: animals.slice(0, 8),
+      drops: drops.slice(0, 8),
+    };
+  }
+
+  private getMemorySummary(): string {
+    const task = this.memory.activeTask
+      ? `${this.memory.activeTask.goal}: plan=[${this.memory.activeTask.plan.join(' > ')}], progress=[${this.memory.activeTask.progress.join(' | ')}]`
+      : 'none';
+    const home = this.memory.home
+      ? `${this.memory.home.label ?? 'home'}@(${this.memory.home.x.toFixed(0)},${this.memory.home.y.toFixed(0)},${this.memory.home.z.toFixed(0)}) ${this.memory.home.dimension ?? ''}`.trim()
+      : 'not set';
+    const locs = (positions: StoredPosition[]) => positions
+      .slice(0, 10)
+      .map(p => `${p.label ?? 'spot'}@(${p.x.toFixed(0)},${p.y.toFixed(0)},${p.z.toFixed(0)})`)
+      .join('; ') || 'none';
+    const avoid = this.memory.avoidAreas
+      .slice(0, 10)
+      .map(p => `${p.reason}@(${p.x.toFixed(0)},${p.y.toFixed(0)},${p.z.toFixed(0)})`)
+      .join('; ') || 'none';
+    const notes = Object.entries({ ...this.memory.notes, ...Object.fromEntries(this.notes.entries()) })
+      .slice(0, 12)
+      .map(([k, v]) => `${k}: ${v}`)
+      .join('; ') || 'none';
+
+    return [
+      `owner=${this.memory.owner ?? 'unknown'}`,
+      `home=${home}`,
+      `known_chests=${locs(this.memory.knownChests)}`,
+      `known_resources=${locs(this.memory.knownResources)}`,
+      `avoid_areas=${avoid}`,
+      `active_task=${task}`,
+      `notes=${notes}`,
+    ].join(' | ');
+  }
+
+  private getItemByName(itemName: string) {
+    return this.bot.registry.itemsByName[itemName]
+      ?? Object.values(this.bot.registry.itemsByName).find(i => i.name.includes(itemName));
+  }
+
+  private getInventoryCountByType(itemType: number): number {
+    return this.bot.inventory.items()
+      .filter(i => i.type === itemType)
+      .reduce((sum, item) => sum + item.count, 0);
+  }
+
+  private getCraftingTableNearby(maxDistance = 32): ReturnType<Bot['blockAt']> {
+    const tableType = this.bot.registry.blocksByName['crafting_table'];
+    if (!tableType) return null;
+    const positions = this.bot.findBlocks({ matching: tableType.id, maxDistance, count: 1 });
+    if (!positions.length) return null;
+    return this.bot.blockAt(positions[0]);
+  }
+
+  private getRecipeAnalysis(itemName: string, requestedCount = 1): string {
+    const itemType = this.getItemByName(itemName);
+    if (!itemType) return `Unknown item: ${itemName}`;
+
+    const table = this.getCraftingTableNearby();
+    const recipes = [
+      ...this.bot.recipesFor(itemType.id, null, 1, null),
+      ...(table ? this.bot.recipesFor(itemType.id, null, 1, table) : []),
+    ];
+
+    if (!recipes.length) {
+      return table
+        ? `No known recipe for ${itemType.name}`
+        : `No available recipe for ${itemType.name}; a crafting table may be needed or recipe is unknown`;
+    }
+
+    const recipe = recipes[0] as any;
+    const resultCount = Math.max(1, recipe.result?.count ?? 1);
+    const craftsNeeded = Math.ceil(requestedCount / resultCount);
+    const ingredients: Array<{ name: string; needed: number; have: number; missing: number }> = (recipe.delta ?? [])
+      .filter((d: any) => d.count < 0)
+      .map((d: any) => {
+        const needed = Math.abs(d.count) * craftsNeeded;
+        const have = this.getInventoryCountByType(d.id);
+        const name = this.bot.registry.items[d.id]?.name ?? `item_${d.id}`;
+        return { name, needed, have, missing: Math.max(0, needed - have) };
+      });
+
+    const missing = ingredients.filter(i => i.missing > 0);
+    const tableText = recipe.requiresTable ? (table ? 'crafting_table=nearby' : 'crafting_table=missing') : 'crafting_table=not_required';
+    const ingredientText = ingredients.length
+      ? ingredients.map(i => `${i.name} ${i.have}/${i.needed}${i.missing ? ` missing ${i.missing}` : ''}`).join(', ')
+      : 'none';
+
+    return [
+      `item=${itemType.name}`,
+      `count=${requestedCount}`,
+      tableText,
+      `can_craft=${missing.length === 0 && (!recipe.requiresTable || Boolean(table))}`,
+      `ingredients=${ingredientText}`,
+      missing.length ? `missing=${missing.map(i => `${i.name}x${i.missing}`).join(', ')}` : 'missing=none',
+    ].join(' | ');
+  }
+
+  private getInventorySummary(): string {
+    const items = this.bot.inventory.items();
+    const groups: Record<string, string[]> = {
+      wood: [],
+      blocks: [],
+      ores: [],
+      ingots: [],
+      tools: [],
+      weapons: [],
+      armor: [],
+      food: [],
+      fuel: [],
+      valuables: [],
+      misc: [],
+    };
+    const foodNames = new Set(Object.keys((this.bot.registry as any).foodsByName ?? {}));
+    const armorPattern = /_(helmet|chestplate|leggings|boots)$/;
+
+    for (const item of items) {
+      const label = `${item.name}x${item.count}`;
+      if (/(log|stem|planks|stick)$/.test(item.name)) groups.wood.push(label);
+      else if (item.name.endsWith('_ore') || item.name.startsWith('raw_')) groups.ores.push(label);
+      else if (item.name.endsWith('_ingot')) groups.ingots.push(label);
+      else if (/_(pickaxe|axe|shovel|hoe)$/.test(item.name) || item.name === 'shears') groups.tools.push(label);
+      else if (item.name.includes('sword') || item.name === 'bow' || item.name === 'crossbow') groups.weapons.push(label);
+      else if (armorPattern.test(item.name) || item.name === 'shield') groups.armor.push(label);
+      else if (foodNames.has(item.name)) groups.food.push(label);
+      else if (item.name.includes('coal') || item.name === 'charcoal' || item.name.includes('plank') || item.name.includes('log')) groups.fuel.push(label);
+      else if (/(diamond|emerald|netherite|gold|lapis|redstone)/.test(item.name)) groups.valuables.push(label);
+      else if (this.bot.registry.blocksByName[item.name]) groups.blocks.push(label);
+      else groups.misc.push(label);
+    }
+
+    return [
+      `slots=${items.length}/36`,
+      ...Object.entries(groups).map(([name, entries]) => `${name}=${entries.join(', ') || 'none'}`),
+    ].join(' | ');
+  }
+
+  private getDangerReport(radius = 12): { severity: 'safe' | 'caution' | 'danger'; summary: string; threat?: any } {
+    const bot = this.bot;
+    const risks: string[] = [];
+    let severity: 'safe' | 'caution' | 'danger' = 'safe';
+    let nearestThreat: any;
+
+    if ((bot.health ?? 20) <= 6) {
+      severity = 'danger';
+      risks.push(`low_health=${(bot.health ?? 0).toFixed(1)}/20`);
+    } else if ((bot.health ?? 20) <= 12) {
+      severity = 'caution';
+      risks.push(`health=${(bot.health ?? 0).toFixed(1)}/20`);
+    }
+
+    if ((bot.food ?? 20) <= 6) {
+      severity = 'danger';
+      risks.push(`low_food=${bot.food}/20`);
+    } else if ((bot.food ?? 20) <= 14) {
+      if (severity === 'safe') severity = 'caution';
+      risks.push(`food=${bot.food}/20`);
+    }
+
+    const hostiles = Object.values(bot.entities)
+      .filter(e => bot.entity && bot.entity.position.distanceTo(e.position) <= radius && HOSTILE_MOBS.has(e.name?.toLowerCase() ?? ''))
+      .sort((a, b) => bot.entity!.position.distanceTo(a.position) - bot.entity!.position.distanceTo(b.position));
+    if (hostiles.length) {
+      nearestThreat = hostiles[0];
+      const closest = bot.entity!.position.distanceTo(nearestThreat.position);
+      severity = closest <= 5 ? 'danger' : severity === 'safe' ? 'caution' : severity;
+      risks.push(`hostiles=${hostiles.slice(0, 4).map(e => `${e.name}:${bot.entity!.position.distanceTo(e.position).toFixed(0)}m`).join(',')}`);
+    }
+
+    const p = bot.entity!.position.floored();
+    const hazards = ['lava', 'fire', 'cactus', 'magma_block', 'campfire', 'soul_campfire'];
+    const foundHazards: string[] = [];
+    for (let dx = -3; dx <= 3; dx++) {
+      for (let dy = -2; dy <= 1; dy++) {
+        for (let dz = -3; dz <= 3; dz++) {
+          const b = bot.blockAt(p.offset(dx, dy, dz), false);
+          if (b && hazards.includes(b.name)) foundHazards.push(`${b.name}@${bot.entity!.position.distanceTo(b.position).toFixed(0)}m`);
+        }
+      }
+    }
+    if (foundHazards.length) {
+      severity = 'danger';
+      risks.push(`hazards=${foundHazards.slice(0, 4).join(',')}`);
+    }
+
+    const below = bot.blockAt(p.offset(0, -1, 0), false);
+    const twoBelow = bot.blockAt(p.offset(0, -2, 0), false);
+    if (below?.name === 'air' && twoBelow?.name === 'air') {
+      severity = 'danger';
+      risks.push('fall_risk=true');
+    }
+
+    const head = bot.blockAt(p.offset(0, 1, 0), false);
+    if (head?.name === 'water' || head?.name === 'bubble_column') {
+      severity = 'danger';
+      risks.push('drowning_risk=true');
+    }
+
+    const timeOfDay = bot.time?.timeOfDay ?? 0;
+    if (timeOfDay >= 13000 && timeOfDay <= 23000) {
+      if (severity === 'safe') severity = 'caution';
+      risks.push('night=true');
+    }
+
+    return {
+      severity,
+      summary: risks.length ? `${severity}: ${risks.join(' | ')}` : 'safe: no immediate danger detected',
+      threat: nearestThreat,
+    };
+  }
+
+  private async craftItemByName(itemName: string, count = 1): Promise<string> {
+    return this.executeTool('craft_item', { item_name: itemName, count });
+  }
+
+  private async gatherBlocksByNames(blockNames: string[], count: number, maxDistance: number): Promise<string> {
+    const ids = blockNames.flatMap((name) => Object.values(this.bot.registry.blocksByName)
+      .filter(block => block.name === name || block.name.endsWith(`_${name}`) || block.name.endsWith(name))
+      .map(block => block.id));
+    if (!ids.length) return `No matching block types for ${blockNames.join(', ')}`;
+
+    const positions = this.bot.findBlocks({ matching: [...new Set(ids)], maxDistance, count });
+    if (!positions.length) return `No ${blockNames.join('/')} found within ${maxDistance} blocks`;
+
+    let collected = 0;
+    const failures: string[] = [];
+    for (const pos of positions.slice(0, count)) {
+      const result = await this.executeTool('break_and_collect', { x: pos.x, y: pos.y, z: pos.z });
+      if (result.startsWith('Collected') || result.startsWith('Broke')) collected++;
+      else failures.push(result);
+    }
+    return `Collected ${collected}/${Math.min(count, positions.length)} block(s)${failures.length ? `; issues: ${failures.slice(0, 2).join('; ')}` : ''}`;
+  }
+
+  private getBestExistingPickaxe(): string | null {
+    const pickaxes = this.bot.inventory.items()
+      .filter(i => i.name.endsWith('_pickaxe'))
+      .sort((a, b) => this.getToolRank(b.name) - this.getToolRank(a.name));
+    return pickaxes[0]?.name ?? null;
+  }
+
+  private async craftPickaxeSkill(material?: string): Promise<string> {
+    const wanted = material ?? (this.bot.inventory.items().some(i => i.name === 'cobblestone') ? 'stone' : 'wooden');
+    const target = `${wanted}_pickaxe`;
+    const existing = this.getBestExistingPickaxe();
+    if (existing && this.getToolRank(existing) >= this.getToolRank(target)) return `Already have ${existing}`;
+
+    const haveLogs = this.bot.inventory.items().some(i => i.name.endsWith('_log') || i.name.endsWith('_stem'));
+    const havePlanks = this.bot.inventory.items().some(i => i.name.endsWith('_planks'));
+    if (!haveLogs && !havePlanks) return 'Need logs or planks before crafting a pickaxe';
+
+    if (!havePlanks) {
+      const log = this.bot.inventory.items().find(i => i.name.endsWith('_log') || i.name.endsWith('_stem'));
+      if (log) await this.craftItemByName(log.name.replace(/_(log|stem)$/, '_planks'), 1).catch(() => undefined);
+    }
+
+    const hasCraftingTable = this.bot.inventory.items().some(i => i.name === 'crafting_table') || Boolean(this.getCraftingTableNearby());
+    if (!hasCraftingTable) await this.craftItemByName('crafting_table', 1).catch(() => undefined);
+
+    if (!this.bot.inventory.items().some(i => i.name === 'stick')) {
+      await this.craftItemByName('stick', 1).catch(() => undefined);
+    }
+
+    if (wanted === 'stone' && !this.bot.inventory.items().some(i => i.name === 'cobblestone')) {
+      return 'Need cobblestone for a stone pickaxe';
+    }
+
+    return this.craftItemByName(target, 1);
+  }
+
   private makeVec3(x: number, y: number, z: number) {
     if (!this.bot.entity) throw new Error('Bot not spawned');
     const v = this.bot.entity.position.clone();
@@ -996,6 +1751,264 @@ export class MinecraftAgent {
     if (!bot.entity) return 'Bot is not spawned yet';
 
     switch (name) {
+
+      case 'start_task': {
+        const { goal, plan } = args as { goal: string; plan: string[] };
+        this.memory.activeTask = {
+          goal,
+          plan: Array.isArray(plan) ? plan.slice(0, 12) : [],
+          progress: [],
+          startedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        this.saveMemory();
+        return `Started task "${goal}" with ${this.memory.activeTask.plan.length} step(s)`;
+      }
+
+      case 'update_task_progress': {
+        const { progress } = args as { progress: string };
+        if (!this.memory.activeTask) return 'No active task to update';
+        this.memory.activeTask.progress.push(progress);
+        this.memory.activeTask.progress = this.memory.activeTask.progress.slice(-20);
+        this.memory.activeTask.updatedAt = new Date().toISOString();
+        this.saveMemory();
+        return `Task progress saved: ${progress}`;
+      }
+
+      case 'complete_task': {
+        const { summary } = args as { summary?: string };
+        const goal = this.memory.activeTask?.goal ?? 'task';
+        if (summary) this.notes.set(`completed_${Date.now()}`, `${goal}: ${summary}`);
+        this.memory.activeTask = undefined;
+        this.saveMemory();
+        return summary ? `Completed ${goal}: ${summary}` : `Completed ${goal}`;
+      }
+
+      case 'get_current_task': {
+        if (!this.memory.activeTask) return 'No active task';
+        const task = this.memory.activeTask;
+        return `goal=${task.goal} | plan=${task.plan.join(' > ') || 'none'} | progress=${task.progress.join(' | ') || 'none'} | updated=${task.updatedAt}`;
+      }
+
+      case 'read_memory': {
+        return this.getMemorySummary();
+      }
+
+      case 'remember_location': {
+        const { kind, label, x, y, z, reason } = args as {
+          kind: 'home' | 'chest' | 'resource' | 'avoid';
+          label: string;
+          x: number;
+          y: number;
+          z: number;
+          reason?: string;
+        };
+        const position: StoredPosition = { x, y, z, dimension: bot.game.dimension, label };
+        if (kind === 'home') {
+          this.memory.home = position;
+          this.homePosition = { x, y, z };
+        } else if (kind === 'chest') {
+          this.memory.knownChests.push(position);
+          this.memory.knownChests = this.memory.knownChests.slice(-30);
+        } else if (kind === 'resource') {
+          this.memory.knownResources.push(position);
+          this.memory.knownResources = this.memory.knownResources.slice(-50);
+        } else {
+          this.memory.avoidAreas.push({ ...position, reason: reason ?? label });
+          this.memory.avoidAreas = this.memory.avoidAreas.slice(-30);
+        }
+        this.saveMemory();
+        return `Remembered ${kind} ${label} at (${x}, ${y}, ${z})`;
+      }
+
+      case 'inventory_summary': {
+        return this.getInventorySummary();
+      }
+
+      case 'can_craft':
+      case 'missing_materials_for': {
+        const { item_name, count = 1 } = args as { item_name: string; count?: number };
+        return this.getRecipeAnalysis(item_name, count as number);
+      }
+
+      case 'check_danger': {
+        const { radius = 12 } = args as { radius?: number };
+        return this.getDangerReport(Math.min(radius as number, 24)).summary;
+      }
+
+      case 'escape_danger': {
+        const danger = this.getDangerReport(16);
+        if (bot.food !== undefined && bot.food <= 14) {
+          await this.executeTool('eat', {}).catch(() => undefined);
+        }
+        const threat = danger.threat;
+        if (!threat) return `${danger.summary}; no directional threat to escape from`;
+        const p = bot.entity.position;
+        const dx = p.x - threat.position.x;
+        const dz = p.z - threat.position.z;
+        const length = Math.max(1, Math.sqrt(dx * dx + dz * dz));
+        const target = p.offset((dx / length) * 10, 0, (dz / length) * 10);
+        await this.navigateTo(target.x, target.y, target.z, 3, 15000).catch(() => undefined);
+        return `Escaped from ${threat.name ?? 'threat'}; ${this.getDangerReport(16).summary}`;
+      }
+
+      case 'prepare_for_mining': {
+        const danger = this.getDangerReport(12);
+        const results: string[] = [`danger=${danger.summary}`];
+        if ((bot.food ?? 20) <= 14) {
+          results.push(await this.executeTool('eat', {}).catch(err => `eat failed: ${err instanceof Error ? err.message : String(err)}`));
+        }
+        results.push(await this.executeTool('equip_best_armor', {}).catch(() => 'armor check skipped'));
+        const pickaxe = this.getBestExistingPickaxe();
+        if (pickaxe) {
+          results.push(`pickaxe=${pickaxe}`);
+        } else {
+          results.push(await this.craftPickaxeSkill('stone').catch(err => `pickaxe craft failed: ${err instanceof Error ? err.message : String(err)}`));
+        }
+        results.push(this.getInventorySummary());
+        return results.join(' | ');
+      }
+
+      case 'gather_wood': {
+        const { count = 8, max_distance = 48 } = args as { count?: number; max_distance?: number };
+        return this.gatherBlocksByNames(['log', 'stem'], Math.max(1, count as number), Math.min(max_distance as number, 64));
+      }
+
+      case 'craft_pickaxe': {
+        const { material } = args as { material?: string };
+        return this.craftPickaxeSkill(material);
+      }
+
+      case 'deposit_inventory': {
+        const { keep_tools_food_valuables = true } = args as { keep_tools_food_valuables?: boolean };
+        let chest = this.memory.knownChests
+          .map(p => bot.blockAt(this.makeVec3(Math.floor(p.x), Math.floor(p.y), Math.floor(p.z))))
+          .find(b => b && b.name !== 'air') ?? null;
+        if (!chest) chest = this.findNearestBlockByNames(this.getContainerBlockNames(), 32);
+        if (!chest) return 'No known or visible chest nearby';
+
+        await this.navigateTo(chest.position.x, chest.position.y, chest.position.z, 2, 30000);
+        const container = await (bot as any).openContainer(chest);
+        const keepPattern = /pickaxe|axe|shovel|hoe|sword|bow|crossbow|helmet|chestplate|leggings|boots|shield|bread|apple|potato|carrot|beef|pork|chicken|mutton|cod|salmon|diamond|emerald|netherite|ingot|ore|coal|charcoal|arrow/;
+        let deposited = 0;
+        try {
+          for (const item of bot.inventory.items()) {
+            if (keep_tools_food_valuables && keepPattern.test(item.name)) continue;
+            await container.deposit(item.type, null, item.count);
+            deposited++;
+          }
+        } finally {
+          container.close();
+        }
+        this.memory.knownChests.push({ x: chest.position.x, y: chest.position.y, z: chest.position.z, dimension: bot.game.dimension, label: chest.name });
+        this.memory.knownChests = this.memory.knownChests.slice(-30);
+        this.saveMemory();
+        return `Deposited ${deposited} stack(s) into ${chest.name} at (${chest.position.x}, ${chest.position.y}, ${chest.position.z})`;
+      }
+
+      case 'return_home': {
+        if (!this.homePosition && this.memory.home) {
+          this.homePosition = { x: this.memory.home.x, y: this.memory.home.y, z: this.memory.home.z };
+        }
+        return this.executeTool('go_home', {});
+      }
+
+      case 'collect_food': {
+        const { target_count = 4 } = args as { target_count?: number };
+        const foodNames = new Set(Object.keys((bot.registry as any).foodsByName ?? {}));
+        const currentFood = bot.inventory.items().filter(i => foodNames.has(i.name)).reduce((sum, i) => sum + i.count, 0);
+        if (currentFood >= (target_count as number)) return `Already have ${currentFood} food item(s)`;
+
+        const passiveFoodMobs = ['cow', 'pig', 'chicken', 'sheep', 'rabbit', 'cod', 'salmon'];
+        let hunted = 0;
+        for (const mobName of passiveFoodMobs) {
+          if (hunted + currentFood >= (target_count as number)) break;
+          const target = bot.nearestEntity(e => e.name === mobName && bot.entity!.position.distanceTo(e.position) <= 32);
+          if (!target) continue;
+          const result = await this.executeTool('kill_entity', { entity_name: mobName, max_distance: 32 });
+          if (result.includes('Killed')) {
+            hunted++;
+            await this.executeTool('pick_up_items', { max_distance: 8 }).catch(() => undefined);
+          }
+        }
+        const finalFood = bot.inventory.items().filter(i => foodNames.has(i.name)).reduce((sum, i) => sum + i.count, 0);
+        return `Food collection done. Started with ${currentFood}, hunted ${hunted}, now have ${finalFood}`;
+      }
+
+      case 'scan_surroundings': {
+        const { radius = 16 } = args as { radius?: number };
+        const r = Math.min(radius as number, 32);
+        const p = bot.entity.position;
+        const entities = this.getEntityScan(r);
+        const container = this.findNearestBlockByNames(this.getContainerBlockNames(), r);
+        const resources = this.listNearestBlocksByNames([
+          'log', 'coal_ore', 'iron_ore', 'copper_ore', 'gold_ore', 'redstone_ore', 'lapis_ore',
+          'diamond_ore', 'emerald_ore', 'crafting_table', 'furnace', 'bed', 'chest', 'barrel',
+        ], r, 12);
+        const weather = (bot as any).thunderState > 0.5 ? 'thunder' : bot.isRaining ? 'rain' : 'clear';
+        return [
+          `pos=(${p.x.toFixed(1)},${p.y.toFixed(1)},${p.z.toFixed(1)}) dim=${bot.game.dimension}`,
+          `health=${(bot.health ?? 0).toFixed(1)}/20 food=${bot.food ?? 0}/20 weather=${weather}`,
+          `players=${entities.players.join('; ') || 'none'}`,
+          `hostiles=${entities.hostiles.join('; ') || 'none'}`,
+          `animals=${entities.animals.join('; ') || 'none'}`,
+          `drops=${entities.drops.join('; ') || 'none'}`,
+          `nearest_container=${container ? `${container.name}@(${container.position.x},${container.position.y},${container.position.z}) ${this.getDistanceTo(container.position)}m` : 'none'}`,
+          `resources=${resources.join('; ') || 'none'}`,
+          `equipment=${this.getEquipmentSummary()}`,
+        ].join(' | ');
+      }
+
+      case 'get_equipment_status': {
+        return this.getEquipmentSummary();
+      }
+
+      case 'get_best_tool_for_block': {
+        const { block_name, x, y, z } = args as { block_name?: string; x?: number; y?: number; z?: number };
+        let block: NonNullable<ReturnType<Bot['blockAt']>> | null = null;
+        if (typeof x === 'number' && typeof y === 'number' && typeof z === 'number') {
+          block = bot.blockAt(this.makeVec3(x, y, z));
+        } else if (block_name) {
+          const blockInfo = bot.registry.blocksByName[block_name];
+          if (!blockInfo) return `Unknown block: ${block_name}`;
+          block = {
+            ...blockInfo,
+            position: bot.entity.position.floored(),
+          } as unknown as NonNullable<ReturnType<Bot['blockAt']>>;
+        }
+        if (!block || block.name === 'air') return 'No block found for tool check';
+        return this.getBestToolReportForBlock(block);
+      }
+
+      case 'find_nearest_chest': {
+        const { max_distance = 32 } = args as { max_distance?: number };
+        const maxDistance = Math.min(max_distance as number, 64);
+        const block = this.findNearestBlockByNames(this.getContainerBlockNames(), maxDistance);
+        if (!block) return `No chest-like container found within ${maxDistance} blocks`;
+        return `${block.name} at (${block.position.x}, ${block.position.y}, ${block.position.z}), ${this.getDistanceTo(block.position)}m away`;
+      }
+
+
+      case 'equip_best_armor': {
+        const manager = (bot as any).armorManager;
+        if (manager?.equipAll) {
+          await manager.equipAll();
+          return `Equipped best armor. ${this.getEquipmentSummary()}`;
+        }
+        return `Armor manager plugin unavailable. ${this.getEquipmentSummary()}`;
+      }
+
+      case 'find_nearby_resources': {
+        const { max_distance = 32 } = args as { max_distance?: number };
+        const maxDistance = Math.min(max_distance as number, 64);
+        const resources = this.listNearestBlocksByNames([
+          'log', 'coal_ore', 'iron_ore', 'copper_ore', 'gold_ore', 'redstone_ore', 'lapis_ore',
+          'diamond_ore', 'emerald_ore', 'ancient_debris', 'crafting_table', 'furnace', 'bed',
+          'chest', 'barrel', 'water', 'lava',
+        ], maxDistance, 20);
+        return resources.length ? resources.join(', ') : `No tracked resources found within ${maxDistance} blocks`;
+      }
+
       case 'get_position': {
         const p = bot.entity.position;
         return `x=${p.x.toFixed(1)}, y=${p.y.toFixed(1)}, z=${p.z.toFixed(1)}`;
@@ -1220,6 +2233,24 @@ export class MinecraftAgent {
 
         const targetId = target.id;
         const label = target.name ?? target.displayName ?? target.username ?? entity_name;
+        const pvp = (bot as any).pvp;
+        if (pvp?.attack) {
+          pvp.attack(target);
+          return new Promise<string>(resolve => {
+            const timeout = setTimeout(() => {
+              pvp.stop?.();
+              resolve(`Stopped attacking ${label} (timed out)`);
+            }, 30000);
+            const check = setInterval(() => {
+              if (!bot.entities[targetId]) {
+                clearTimeout(timeout);
+                clearInterval(check);
+                pvp.stop?.();
+                resolve(`Killed ${label}`);
+              }
+            }, 500);
+          });
+        }
 
         return new Promise<string>(resolve => {
           const timeout = setTimeout(() => {
@@ -1340,12 +2371,20 @@ export class MinecraftAgent {
         const blockName = block.name;
         const harvestTool = this.chooseBestRegistryHarvestTool(block);
         if (harvestTool) {
-          await bot.equip(harvestTool, 'hand');
+          const toolPluginApi = (bot as any).tool;
+          if (toolPluginApi?.equipForBlock) await toolPluginApi.equipForBlock(block, {});
+          else await bot.equip(harvestTool, 'hand');
         } else if (block.harvestTools) {
           return this.summarizeRegistryHarvestRequirement(block);
         }
 
         if (!bot.canDigBlock(block)) return `Cannot dig ${block.name} (wrong tool or unbreakable)`;
+
+        const collectBlock = (bot as any).collectBlock;
+        if (collectBlock?.collect) {
+          await collectBlock.collect(block);
+          return `Collected ${blockName} at (${x}, ${y}, ${z})`;
+        }
 
         if (bot.entity.position.distanceTo(targetPos) > 4) await this.navigateTo(x, y, z, 2, 30000);
         await bot.dig(block);
@@ -1578,10 +2617,15 @@ export class MinecraftAgent {
       case 'set_home': {
         const p = bot.entity.position;
         this.homePosition = { x: p.x, y: p.y, z: p.z };
+        this.memory.home = { x: p.x, y: p.y, z: p.z, dimension: bot.game.dimension, label: 'home' };
+        this.saveMemory();
         return `Home set at (${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)})`;
       }
 
       case 'go_home': {
+        if (!this.homePosition && this.memory.home) {
+          this.homePosition = { x: this.memory.home.x, y: this.memory.home.y, z: this.memory.home.z };
+        }
         if (!this.homePosition) return 'No home set — use set_home first';
         const { x, y, z } = this.homePosition;
         await this.navigateTo(x, y, z, 2, 60000);
@@ -1591,6 +2635,7 @@ export class MinecraftAgent {
       case 'write_note': {
         const { key, value } = args as { key: string; value: string };
         this.notes.set(key, value);
+        this.saveMemory();
         return `Note saved: "${key}"`;
       }
 

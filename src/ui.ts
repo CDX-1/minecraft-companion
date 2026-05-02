@@ -5,8 +5,14 @@ import { shouldIgnoreChatSender } from './chatFilter';
 import { parseChatCommand } from './commands';
 import { BotConfig } from './config';
 import { MinecraftAgent } from './agent';
+import { GlobalPushToTalk, startGlobalPushToTalk } from './globalPushToTalk';
 import { createElevenLabsSpeaker, ElevenLabsSpeaker } from './services/elevenLabs';
 import { startVoiceServer, VoiceServer } from './voiceServer';
+
+const armorManager = require('mineflayer-armor-manager');
+const collectBlockPlugin = require('mineflayer-collectblock').plugin;
+const pvpPlugin = require('mineflayer-pvp').plugin;
+const toolPlugin = require('mineflayer-tool').plugin;
 
 export function launchUI(config: BotConfig): void {
   const screen = blessed.screen({
@@ -87,11 +93,13 @@ export function launchUI(config: BotConfig): void {
 
   let voiceServer: VoiceServer | null = null;
   let voiceSpeaker: ElevenLabsSpeaker | null = null;
+  let globalPushToTalk: GlobalPushToTalk | null = null;
   let agent: MinecraftAgent | null = null;
 
   const openaiApiKey = process.env.OPENAI_API_KEY?.trim();
 
   screen.key(['C-c'], () => {
+    globalPushToTalk?.close();
     voiceServer?.close();
     process.exit(0);
   });
@@ -124,6 +132,34 @@ export function launchUI(config: BotConfig): void {
   function logError(message: string) {
     chatLog.log(`{red-fg}[error]{/red-fg} ${message}`);
     screen.render();
+  }
+
+  function loadPluginSafely(name: string, plugin: Parameters<Bot['loadPlugin']>[0]) {
+    try {
+      bot.loadPlugin(plugin);
+      logSystem(`Plugin loaded: ${name}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logWarning(`Plugin ${name} not loaded: ${message}`);
+    }
+  }
+
+  async function loadAutoEatSafely() {
+    try {
+      const autoEat = await import('mineflayer-auto-eat');
+      bot.loadPlugin(autoEat.loader);
+      const botAny = bot as any;
+      botAny.autoEat?.setOpts?.({
+        minHunger: 15,
+        minHealth: 14,
+        returnToLastItem: true,
+      });
+      botAny.autoEat?.enableAuto?.();
+      logSystem('Plugin loaded: mineflayer-auto-eat');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logWarning(`Plugin mineflayer-auto-eat not loaded: ${message}`);
+    }
   }
 
   function setupElevenLabs() {
@@ -213,6 +249,27 @@ export function launchUI(config: BotConfig): void {
       });
 
       logVoice(`Manual launch only: ${voiceServer.url}`);
+      try {
+        globalPushToTalk = await startGlobalPushToTalk({
+          key: 'V',
+          onStart: () => {
+            voiceServer?.setPushToTalkActive(true);
+            logVoice('push-to-talk start');
+          },
+          onStop: () => {
+            voiceServer?.setPushToTalkActive(false);
+            logVoice('push-to-talk stop');
+          },
+          onStatus: logVoice,
+          onError: (message) => {
+            logWarning(`${message}. On macOS, grant Terminal/your editor Accessibility permission.`);
+          },
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logWarning(`Global push-to-talk unavailable: ${message}`);
+        logWarning('On macOS, grant Terminal/your editor Accessibility permission, then restart.');
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logError(`Failed to start voice server: ${message}`);
@@ -243,7 +300,11 @@ export function launchUI(config: BotConfig): void {
       auth: config.auth,
     });
 
-    bot.loadPlugin(pathfinder);
+    loadPluginSafely('mineflayer-pathfinder', pathfinder);
+    loadPluginSafely('mineflayer-tool', toolPlugin);
+    loadPluginSafely('mineflayer-collectblock', collectBlockPlugin);
+    loadPluginSafely('mineflayer-pvp', pvpPlugin);
+    loadPluginSafely('mineflayer-armor-manager', armorManager);
 
     bot.once('spawn', () => {
       statusBar.setContent(
@@ -255,6 +316,8 @@ export function launchUI(config: BotConfig): void {
       statusBar.style.bg = 'green';
       logSystem(`Spawned as ${bot.username}.`);
       infoTimer = setInterval(renderInfo, 1000);
+      void loadAutoEatSafely();
+      void (bot as any).armorManager?.equipAll?.().catch?.(() => undefined);
 
       if (openaiApiKey) {
         agent = new MinecraftAgent(bot, openaiApiKey, (msg) => {
@@ -314,6 +377,8 @@ export function launchUI(config: BotConfig): void {
 
     bot.on('end', (reason) => {
       if (infoTimer) clearInterval(infoTimer);
+      globalPushToTalk?.close();
+      globalPushToTalk = null;
       voiceServer?.close();
       logWarning(`Disconnected: ${reason}`);
       statusBar.setContent(`  Disconnected: ${reason}`);

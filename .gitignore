@@ -2,3 +2,4 @@ node_modules/
 dist/
 .env
 *.js.map
+.minecraft-companion-memory.json
