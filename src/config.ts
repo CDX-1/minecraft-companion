@@ -12,4 +12,6 @@ export interface BotConfig {
   elevenLabsModelId?: string;
   elevenLabsStability: number;
   elevenLabsSimilarityBoost: number;
+  elevenLabsStreaming: boolean;
+  elevenLabsLatency: number;
 }

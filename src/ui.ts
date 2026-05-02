@@ -95,6 +95,8 @@ export function launchUI(config: BotConfig): void {
         modelId: config.elevenLabsModelId ?? 'eleven_turbo_v2_5',
         stability: config.elevenLabsStability,
         similarityBoost: config.elevenLabsSimilarityBoost,
+        streaming: config.elevenLabsStreaming,
+        latency: config.elevenLabsLatency,
       },
       (message) => {
         chatLog.log(`{red-fg}${message}{/red-fg}`);
@@ -102,7 +104,8 @@ export function launchUI(config: BotConfig): void {
       }
     );
 
-    chatLog.log('{magenta-fg}[voice] ElevenLabs voice synthesis enabled.{/magenta-fg}');
+    const mode = config.elevenLabsStreaming ? 'streaming' : 'buffered';
+    chatLog.log(`{magenta-fg}[voice] ElevenLabs voice synthesis enabled (${mode}).{/magenta-fg}`);
     screen.render();
   }
 
