@@ -10,6 +10,7 @@ import { BuilderCrewSession } from './services/builderCrew';
 import { buildFromPrompt, editFromPrompt, findNearestBuild, listStoredBuilds, GeneratedBuild } from './services/geminiBuilder';
 import { MemoryManager } from './agent/MemoryManager';
 import { StateMachine } from './agent/StateMachine';
+import { createServerSafeMovements } from './pathfinderMovements';
 
 const BUILD_VOICELINES: Record<Personality, {
   ack: string[];
@@ -1277,7 +1278,7 @@ export class MinecraftAgent {
 
   private getMovements(): Movements {
     if (!this.movements) {
-      this.movements = new Movements(this.bot);
+      this.movements = createServerSafeMovements(this.bot);
     }
     return this.movements;
   }

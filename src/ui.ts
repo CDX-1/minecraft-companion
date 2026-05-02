@@ -1,6 +1,6 @@
 import blessed from 'blessed';
 import mineflayer, { Bot } from 'mineflayer';
-import { pathfinder, Movements, goals } from 'mineflayer-pathfinder';
+import { pathfinder, goals } from 'mineflayer-pathfinder';
 import { shouldIgnoreChatSender } from './chatFilter';
 import { parseChatCommand } from './commands';
 import { BotConfig } from './config';
@@ -16,6 +16,7 @@ import { createElevenLabsSpeaker, ElevenLabsSpeaker } from './services/elevenLab
 import { BuildStatus } from './services/builder';
 import { startVoiceServer, VoiceServer } from './voiceServer';
 import { createDistanceHoldDetector } from './waveGesture';
+import { createServerSafeMovements } from './pathfinderMovements';
 
 const armorManager = require('mineflayer-armor-manager');
 const collectBlockPlugin = require('mineflayer-collectblock').plugin;
@@ -280,7 +281,7 @@ export function launchUI(config: BotConfig): void {
     botSay('Following you.');
     logSystem(`Following ${username}.`);
 
-    bot.pathfinder.setMovements(new Movements(bot));
+    bot.pathfinder.setMovements(createServerSafeMovements(bot));
     bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
   }
 

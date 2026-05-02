@@ -1,9 +1,10 @@
 import 'dotenv/config';
 import mineflayer, { Bot } from 'mineflayer';
-import { pathfinder, Movements, goals } from 'mineflayer-pathfinder';
+import { pathfinder, goals } from 'mineflayer-pathfinder';
 import { shouldIgnoreChatSender } from './chatFilter';
 import { parseChatCommand } from './commands';
 import { readOwnerUsernameFromMemory } from './ownerConfig';
+import { createServerSafeMovements } from './pathfinderMovements';
 
 const bot: Bot = mineflayer.createBot({
   host: process.env.MC_HOST ?? 'localhost',
@@ -26,7 +27,7 @@ function followPlayer(username: string): void {
   }
 
   bot.chat('Following you.');
-  bot.pathfinder.setMovements(new Movements(bot));
+  bot.pathfinder.setMovements(createServerSafeMovements(bot));
   bot.pathfinder.setGoal(new goals.GoalFollow(target, FOLLOW_RANGE), true);
 }
 
