@@ -213,6 +213,10 @@ export function launchUI(config: BotConfig): void {
     void voiceSpeaker?.speak(message);
   }
 
+  function botSayVoiceOnly(message: string) {
+    void voiceSpeaker?.speak(message);
+  }
+
   function followPlayer(username: string) {
     const target = bot.players[username]?.entity;
 
@@ -436,7 +440,7 @@ export function launchUI(config: BotConfig): void {
           },
           (msg) => {
             chatLog.log(`{yellow-fg}[auto]{/yellow-fg} ${msg}`);
-            botSay(msg);
+            botSayVoiceOnly(msg);
             screen.render();
           },
           (status) => {

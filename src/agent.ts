@@ -5,7 +5,7 @@ import type { Bot } from 'mineflayer';
 import { Movements, goals } from 'mineflayer-pathfinder';
 import { Vec3 } from 'vec3';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
-import { BuildSession, BuildStatus } from './services/builder';
+import { BuildSession, BuildStatus, rotateBlockState } from './services/builder';
 import { buildFromPrompt, GeneratedBuild } from './services/geminiBuilder';
 
 function looksLikeBuildIntent(message: string): boolean {
@@ -2180,15 +2180,24 @@ export class MinecraftAgent {
     // Lock origin from the first pass so all passes render in the same spot
     // and replay() diffs cleanly across them (player sees the structure evolve).
     const origin = this.builder.defaultOrigin(playerCtx);
+    const rot = origin.rotation ?? 0;
     const placeBuild = (b: GeneratedBuild) => {
       const cx = Math.floor(b.width / 2);
       const cz = Math.floor(b.length / 2);
-      return b.blocks.map(blk => ({
-        x: origin.x + blk.x - cx,
-        y: origin.y + blk.y,
-        z: origin.z + blk.z - cz,
-        block: blk.block,
-      }));
+      return b.blocks.map(blk => {
+        const lx = blk.x - cx;
+        const lz = blk.z - cz;
+        let rx = lx, rz = lz;
+        if (rot === 90)  { rx = -lz; rz =  lx; }
+        else if (rot === 180) { rx = -lx; rz = -lz; }
+        else if (rot === 270) { rx =  lz; rz = -lx; }
+        return {
+          x: origin.x + rx,
+          y: origin.y + blk.y,
+          z: origin.z + rz,
+          block: rotateBlockState(blk.block, rot),
+        };
+      });
     };
 
     // Streaming render: each pass kicks off a replay immediately and we DON'T
