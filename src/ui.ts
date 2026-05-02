@@ -1,5 +1,6 @@
 import blessed from 'blessed';
 import mineflayer, { Bot } from 'mineflayer';
+import { parseChatCommand } from './commands';
 import { BotConfig } from './config';
 
 export function launchUI(config: BotConfig): void {
@@ -24,7 +25,7 @@ export function launchUI(config: BotConfig): void {
     top: 1,
     left: 0,
     width: '70%',
-    bottom: 3,
+    bottom: 0,
     label: ' Chat ',
     border: { type: 'line' },
     style: {
@@ -43,7 +44,7 @@ export function launchUI(config: BotConfig): void {
     top: 1,
     right: 0,
     width: '30%',
-    bottom: 3,
+    bottom: 0,
     label: ' Info ',
     border: { type: 'line' },
     style: {
@@ -55,36 +56,57 @@ export function launchUI(config: BotConfig): void {
     content: '{gray-fg}Waiting for spawn…{/gray-fg}',
   });
 
-  // ── Input bar (bottom) ────────────────────────────────────
-  const inputBox = blessed.textbox({
-    bottom: 0,
-    left: 0,
-    width: '100%',
-    height: 3,
-    label: ' Message — Enter to send · Ctrl+C to quit ',
-    border: { type: 'line' },
-    style: {
-      border: { fg: 'green' },
-      label: { fg: 'green' },
-      focus: { border: { fg: 'brightwhite' } },
-    },
-    inputOnFocus: true,
-    keys: true,
-    padding: { left: 1 },
-  });
-
   screen.append(statusBar);
   screen.append(chatLog);
   screen.append(infoPanel);
-  screen.append(inputBox);
 
   screen.key(['C-c'], () => process.exit(0));
-  inputBox.focus();
   screen.render();
 
   // ── Bot ───────────────────────────────────────────────────
   let bot: Bot;
   let infoTimer: NodeJS.Timeout | null = null;
+  let followTimer: NodeJS.Timeout | null = null;
+
+  function stopFollowing() {
+    if (followTimer) {
+      clearInterval(followTimer);
+      followTimer = null;
+    }
+
+    bot?.setControlState('forward', false);
+    bot?.setControlState('sprint', false);
+  }
+
+  function followPlayer(username: string) {
+    const target = bot.players[username]?.entity;
+
+    if (!target) {
+      bot.chat("I can't see you.");
+      chatLog.log(`{yellow-fg}[bot] Could not see ${username} to follow.{/yellow-fg}`);
+      screen.render();
+      return;
+    }
+
+    stopFollowing();
+    bot.chat('Following you.');
+    chatLog.log(`{green-fg}[bot] Following ${username}.{/green-fg}`);
+    screen.render();
+
+    followTimer = setInterval(() => {
+      const currentTarget = bot.players[username]?.entity;
+
+      if (!currentTarget) {
+        stopFollowing();
+        return;
+      }
+
+      const distance = bot.entity.position.distanceTo(currentTarget.position);
+      bot.lookAt(currentTarget.position.offset(0, currentTarget.height, 0), true).catch(() => undefined);
+      bot.setControlState('forward', distance > 2);
+      bot.setControlState('sprint', distance > 4);
+    }, 250);
+  }
 
   function renderInfo() {
     if (!bot?.entity) return;
@@ -121,7 +143,16 @@ export function launchUI(config: BotConfig): void {
       if (username === bot.username) return;
       chatLog.log(`{cyan-fg}<${username}>{/cyan-fg} ${message}`);
       screen.render();
-      if (message === 'hello') bot.chat('Hello!');
+
+      const command = parseChatCommand(message);
+
+      if (command === 'greet') {
+        bot.chat('hello');
+      }
+
+      if (command === 'follow') {
+        followPlayer(username);
+      }
     });
 
     bot.on('error', (err) => {
@@ -133,25 +164,13 @@ export function launchUI(config: BotConfig): void {
 
     bot.on('end', (reason) => {
       if (infoTimer) clearInterval(infoTimer);
+      stopFollowing();
       chatLog.log(`{yellow-fg}[system] Disconnected: ${reason}{/yellow-fg}`);
       statusBar.setContent(`  Disconnected: ${reason}`);
       statusBar.style.bg = 'red';
       screen.render();
     });
   }
-
-  // ── Send chat on Enter ────────────────────────────────────
-  inputBox.on('submit', (text: string) => {
-    const msg = text.trim();
-    if (msg && bot) {
-      bot.chat(msg);
-      chatLog.log(`{white-fg}<${config.username}>{/white-fg} ${msg}`);
-      screen.render();
-    }
-    inputBox.clearValue();
-    inputBox.focus();
-    screen.render();
-  });
 
   connect();
 }
