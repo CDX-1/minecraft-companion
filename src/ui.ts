@@ -3,6 +3,7 @@ import mineflayer, { Bot } from 'mineflayer';
 import { pathfinder, Movements, goals } from 'mineflayer-pathfinder';
 import { parseChatCommand } from './commands';
 import { BotConfig } from './config';
+import { createElevenLabsSpeaker, ElevenLabsSpeaker } from './services/elevenLabs';
 import { handleVoiceTranscript } from './voiceCommands';
 import { startVoiceServer, VoiceServer } from './voiceServer';
 
@@ -64,6 +65,7 @@ export function launchUI(config: BotConfig): void {
   screen.append(infoPanel);
 
   let voiceServer: VoiceServer | null = null;
+  let voiceSpeaker: ElevenLabsSpeaker | null = null;
 
   screen.key(['C-c'], () => {
     voiceServer?.close();
@@ -77,17 +79,49 @@ export function launchUI(config: BotConfig): void {
 
   const FOLLOW_RANGE = 2;
 
+  function setupElevenLabs() {
+    if (!config.elevenLabsEnabled) return;
+
+    if (!config.elevenLabsApiKey || !config.elevenLabsVoiceId) {
+      chatLog.log('{yellow-fg}[voice] ElevenLabs is enabled, but API key or voice ID is missing.{/yellow-fg}');
+      screen.render();
+      return;
+    }
+
+    voiceSpeaker = createElevenLabsSpeaker(
+      {
+        apiKey: config.elevenLabsApiKey,
+        voiceId: config.elevenLabsVoiceId,
+        modelId: config.elevenLabsModelId ?? 'eleven_turbo_v2_5',
+        stability: config.elevenLabsStability,
+        similarityBoost: config.elevenLabsSimilarityBoost,
+      },
+      (message) => {
+        chatLog.log(`{red-fg}${message}{/red-fg}`);
+        screen.render();
+      }
+    );
+
+    chatLog.log('{magenta-fg}[voice] ElevenLabs voice synthesis enabled.{/magenta-fg}');
+    screen.render();
+  }
+
+  function botSay(message: string) {
+    bot.chat(message);
+    void voiceSpeaker?.speak(message);
+  }
+
   function followPlayer(username: string) {
     const target = bot.players[username]?.entity;
 
     if (!target) {
-      bot.chat("I can't see you.");
+      botSay("I can't see you.");
       chatLog.log(`{yellow-fg}[bot] Could not see ${username} to follow.{/yellow-fg}`);
       screen.render();
       return;
     }
 
-    bot.chat('Following you.');
+    botSay('Following you.');
     chatLog.log(`{green-fg}[bot] Following ${username}.{/green-fg}`);
     screen.render();
 
@@ -113,7 +147,7 @@ export function launchUI(config: BotConfig): void {
           const handled = handleVoiceTranscript(text, {
             characterName: bot.username,
             ownerUsername: config.ownerUsername,
-            sayHello: () => bot.chat('hello'),
+            sayHello: () => botSay('hello'),
             follow: followPlayer,
           });
 
@@ -175,7 +209,7 @@ export function launchUI(config: BotConfig): void {
       const command = parseChatCommand(message, bot.username);
 
       if (command === 'greet') {
-        bot.chat('hello');
+        botSay('hello');
       }
 
       if (command === 'follow') {
@@ -201,5 +235,6 @@ export function launchUI(config: BotConfig): void {
   }
 
   void startVoiceCommands();
+  setupElevenLabs();
   connect();
 }
