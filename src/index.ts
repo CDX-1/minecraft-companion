@@ -19,6 +19,9 @@ async function main() {
     ? process.env.ELEVENLABS_STREAMING === 'true'
     : true;
   const envElevenLabsLatency = Math.max(0, Math.min(4, Number(process.env.ELEVENLABS_LATENCY) || 4));
+  const envVoiceAutoOpen = process.env.VOICE_AUTO_OPEN
+    ? process.env.VOICE_AUTO_OPEN === 'true'
+    : true;
 
   const answers = await inquirer.prompt([
     {
@@ -72,6 +75,13 @@ async function main() {
     },
     {
       type: 'confirm',
+      name: 'voiceAutoOpen',
+      message: 'Auto-open the voice page in your browser?',
+      default: envVoiceAutoOpen,
+      when: (answers) => answers.voiceEnabled,
+    },
+    {
+      type: 'confirm',
       name: 'elevenLabsEnabled',
       message: 'Enable ElevenLabs voice synthesis?',
       default: envElevenLabsEnabled,
@@ -121,6 +131,7 @@ async function main() {
 
   const config: BotConfig = {
     ...answers,
+    voiceAutoOpen: envVoiceAutoOpen ?? answers.voiceAutoOpen ?? true,
     elevenLabsEnabled: envElevenLabsEnabled ? true : answers.elevenLabsEnabled ?? false,
     elevenLabsApiKey: envElevenLabsApiKey ?? answers.elevenLabsApiKey,
     elevenLabsVoiceId: envElevenLabsVoiceId ?? answers.elevenLabsVoiceId,

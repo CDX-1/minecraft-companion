@@ -1,4 +1,5 @@
 import blessed from 'blessed';
+import { exec } from 'node:child_process';
 import mineflayer, { Bot } from 'mineflayer';
 import { pathfinder, Movements, goals } from 'mineflayer-pathfinder';
 import { BotConfig } from './config';
@@ -132,6 +133,26 @@ export function launchUI(config: BotConfig): void {
     bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
   }
 
+  function tryOpenVoicePage(url: string) {
+    if (!config.voiceAutoOpen) return;
+
+    let command = '';
+    if (process.platform === 'win32') {
+      command = `cmd /c start "" "${url}"`;
+    } else if (process.platform === 'darwin') {
+      command = `open "${url}"`;
+    } else {
+      command = `xdg-open "${url}"`;
+    }
+
+    exec(command, (err) => {
+      if (!err) return;
+      const message = err instanceof Error ? err.message : String(err);
+      chatLog.log(`{yellow-fg}[voice] Auto-open failed: ${message}{/yellow-fg}`);
+      screen.render();
+    });
+  }
+
   async function startVoiceCommands() {
     if (!config.voiceEnabled) return;
 
@@ -171,6 +192,7 @@ export function launchUI(config: BotConfig): void {
         },
       });
 
+      tryOpenVoicePage(voiceServer.url);
       chatLog.log(`{magenta-fg}[voice] Open ${voiceServer.url} in Chrome or Edge and allow microphone access.{/magenta-fg}`);
       screen.render();
     } catch (err) {
