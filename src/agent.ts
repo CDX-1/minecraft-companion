@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Bot } from 'mineflayer';
 import { Movements, goals } from 'mineflayer-pathfinder';
+import { Vec3 } from 'vec3';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
 
 export type LlmProvider = 'openai' | 'gemini';
@@ -30,6 +31,8 @@ type GeminiGenerateContentResponse = {
 
 type StoredPosition = { x: number; y: number; z: number; dimension?: string; label?: string };
 type ActiveTask = { goal: string; plan: string[]; progress: string[]; startedAt: string; updatedAt: string };
+type NavigationGoal = { id: number; x: number; y: number; z: number; range: number };
+type FollowGoal = { username: string; range: number };
 
 type AgentMemory = {
   version: 1;
@@ -67,7 +70,8 @@ SITUATIONAL AWARENESS — always check before concluding you can't do something:
 - Need an item? Check inventory (find_item) first. Not there? Search the world (find_blocks), navigate, and collect it.
 - Need to craft? Verify ingredients with find_item. Missing any? Gather them first, then craft.
 - Need to go somewhere? Use find_blocks or find_entities to locate it, then move_to.
-- Blocked or stuck? Try an alternate path, dig through, or find another route.
+- Stuck in a hole or need to climb vertically? Use build_up instead of jump/place_block loops.
+- Blocked or stuck? Try an alternate path, dig through, build_up, or find another route.
 - Remember important discoveries using remember_location/write_note and read_memory/read_notes later.
 
 EXECUTION RULES:
@@ -89,6 +93,7 @@ BAD responses: "Executing navigation protocol", "Task completed successfully", "
 TOOL SELECTION GUIDE:
 - Goal tracking: start_task -> act -> update_task_progress -> complete_task
 - Collecting blocks: break_and_collect gets the drop; dig_block just digs (use when drop doesn't matter)
+- Vertical escape: build_up is the correct way to pillar upward; don't loop jump + place_block
 - Mining safety: break_and_collect uses Mineflayer's registry to equip valid tools and refuse unsafe harvests
 - Combat: kill_entity fights until dead; attack_entity is one hit (use for tagging or finishing)
 - Danger: check_danger gives an immediate risk report; escape_danger moves away from threats/lava when possible
@@ -459,6 +464,20 @@ const TOOLS: ChatCompletionTool[] = [
       name: 'jump',
       description: 'Make the bot jump once',
       parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'build_up',
+      description: 'Pillar upward correctly by jumping and placing solid blocks under the bot. Use this to escape holes or climb vertically; do not fake this with repeated jump/place_block calls.',
+      parameters: {
+        type: 'object',
+        properties: {
+          height: { type: 'number', description: 'How many blocks to build upward (default 1, max 8).' },
+          block_name: { type: 'string', description: 'Optional block to use, e.g. dirt, cobblestone, oak_planks. If omitted, picks a safe scaffold block.' },
+        },
+      },
     },
   },
   {
@@ -905,6 +924,9 @@ export class MinecraftAgent {
   private readonly memoryPath = path.join(process.cwd(), '.minecraft-companion-memory.json');
   private memory: AgentMemory = this.createEmptyMemory();
   private homePosition: { x: number; y: number; z: number } | null = null;
+  private navigationSeq = 0;
+  private activeNavigationGoal: NavigationGoal | null = null;
+  private activeFollowGoal: FollowGoal | null = null;
   private defendActive = false;
   private defendTick: (() => void) | null = null;
   private lastDefendAttack = 0;
@@ -1018,6 +1040,7 @@ export class MinecraftAgent {
     (bot as any).on('entityHurt', (entity: any) => {
       if (!bot.entity || entity !== bot.entity) return;
       const now = Date.now();
+      this.scheduleMovementRecoveryAfterDamage();
       if (now - this.lastDamageWarn < 5000) return;
       this.lastDamageWarn = now;
       this.onAutonomousMessage?.('ouch! taking damage!');
@@ -1039,18 +1062,51 @@ export class MinecraftAgent {
     });
   }
 
+  private scheduleMovementRecoveryAfterDamage(): void {
+    setTimeout(() => this.recoverMovementAfterDamage(), 350);
+    setTimeout(() => this.recoverMovementAfterDamage(), 1200);
+  }
+
+  private recoverMovementAfterDamage(): void {
+    const bot = this.bot;
+    if (!bot.entity) return;
+
+    const autoEat = (bot as any).autoEat;
+    if (autoEat?.isEating) return;
+
+    if (this.activeFollowGoal) {
+      const target = bot.players[this.activeFollowGoal.username]?.entity;
+      if (!target) return;
+      bot.pathfinder.setMovements(this.getMovements());
+      bot.pathfinder.setGoal(new goals.GoalFollow(target, this.activeFollowGoal.range), true);
+      return;
+    }
+
+    if (!this.activeNavigationGoal) return;
+    const goal = this.activeNavigationGoal;
+    const distance = bot.entity.position.distanceTo(this.makeVec3(goal.x, goal.y, goal.z));
+    if (distance <= goal.range + 0.75) return;
+
+    bot.pathfinder.setMovements(this.getMovements());
+    bot.pathfinder.setGoal(new goals.GoalNear(goal.x, goal.y, goal.z, goal.range));
+  }
+
   private tryFastPath(message: string, sender: string): string | null {
     const lower = message.toLowerCase().trim();
 
     if (/\b(follow me|follow|come with me)\b/.test(lower)) {
       const target = this.bot.players[sender]?.entity;
       if (!target) return "I can't see you.";
+      this.activeNavigationGoal = null;
+      this.activeFollowGoal = { username: sender, range: 2 };
       this.bot.pathfinder.setMovements(this.getMovements());
       this.bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
       return 'Following you!';
     }
 
     if (/\b(stop|halt|stay|wait here)\b/.test(lower)) {
+      this.activeNavigationGoal = null;
+      this.activeFollowGoal = null;
       this.bot.pathfinder.stop();
       this.bot.clearControlStates();
       return 'Stopped.';
@@ -1060,6 +1116,7 @@ export class MinecraftAgent {
       const target = this.bot.players[sender]?.entity;
       if (!target) return "I can't see you.";
       const p = target.position;
+      this.activeFollowGoal = null;
       this.navigateTo(p.x, p.y, p.z, 2).catch(() => {});
       return 'On my way!';
     }
@@ -1718,6 +1775,120 @@ export class MinecraftAgent {
     return this.craftItemByName(target, 1);
   }
 
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  private isAirLike(blockName?: string): boolean {
+    return !blockName || blockName === 'air' || blockName === 'cave_air' || blockName === 'void_air';
+  }
+
+  private chooseScaffoldBlock(blockName?: string) {
+    const badScaffold = new Set([
+      'sand', 'red_sand', 'gravel', 'anvil', 'chipped_anvil', 'damaged_anvil',
+      'torch', 'soul_torch', 'redstone_torch', 'ladder', 'vine', 'scaffolding',
+      'water_bucket', 'lava_bucket', 'tnt', 'obsidian', 'chest', 'barrel',
+      'crafting_table', 'furnace',
+    ]);
+    const preferred = [
+      'cobblestone', 'dirt', 'netherrack', 'deepslate', 'cobbled_deepslate',
+      'stone', 'oak_planks', 'spruce_planks', 'birch_planks', 'andesite',
+      'granite', 'diorite',
+    ];
+    const items = this.bot.inventory.items().filter(item => {
+      if (blockName && !item.name.includes(blockName)) return false;
+      if (badScaffold.has(item.name)) return false;
+      if (!this.bot.registry.blocksByName[item.name]) return false;
+      return item.count > 0;
+    });
+    if (!items.length) return undefined;
+
+    return items.sort((a, b) => {
+      const aRank = preferred.indexOf(a.name);
+      const bRank = preferred.indexOf(b.name);
+      const normalizedA = aRank === -1 ? Number.MAX_SAFE_INTEGER : aRank;
+      const normalizedB = bRank === -1 ? Number.MAX_SAFE_INTEGER : bRank;
+      return normalizedA - normalizedB || b.count - a.count;
+    })[0];
+  }
+
+  private async waitUntil(condition: () => boolean, timeoutMs: number, intervalMs = 50): Promise<boolean> {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      if (condition()) return true;
+      await this.sleep(intervalMs);
+    }
+    return false;
+  }
+
+  private async buildUp(height = 1, blockName?: string): Promise<string> {
+    const bot = this.bot;
+    const levels = Math.max(1, Math.min(Math.floor(height), 8));
+    let placed = 0;
+
+    this.activeNavigationGoal = null;
+    this.activeFollowGoal = null;
+    bot.pathfinder.stop();
+    bot.clearControlStates();
+
+    for (let i = 0; i < levels; i++) {
+      const item = this.chooseScaffoldBlock(blockName);
+      if (!item) {
+        return placed
+          ? `Built up ${placed}/${levels}; out of safe scaffold blocks`
+          : `No safe scaffold blocks${blockName ? ` matching ${blockName}` : ''}`;
+      }
+
+      const feet = bot.entity!.position.floored();
+      const standOnPos = feet.offset(0, -1, 0);
+      const standOnBlock = bot.blockAt(standOnPos);
+      if (!standOnBlock || this.isAirLike(standOnBlock.name)) {
+        return placed
+          ? `Built up ${placed}/${levels}; no solid block below for next pillar`
+          : 'Cannot build up: no solid block below';
+      }
+
+      const bodySpace = bot.blockAt(feet.offset(0, 1, 0), false);
+      const headSpace = bot.blockAt(feet.offset(0, 2, 0), false);
+      if (!this.isAirLike(bodySpace?.name) || !this.isAirLike(headSpace?.name)) {
+        return placed
+          ? `Built up ${placed}/${levels}; blocked overhead`
+          : `Cannot build up: blocked overhead by ${bodySpace?.name ?? headSpace?.name ?? 'block'}`;
+      }
+
+      await bot.equip(item, 'hand');
+      await bot.lookAt(standOnBlock.position.offset(0.5, 1, 0.5), true);
+
+      const startingY = bot.entity!.position.y;
+      bot.setControlState('jump', true);
+      const airborne = await this.waitUntil(() => bot.entity!.position.y > startingY + 0.35, 900, 25);
+      if (!airborne) {
+        bot.setControlState('jump', false);
+        return placed
+          ? `Built up ${placed}/${levels}; jump timing failed`
+          : 'Could not jump high enough to place scaffold';
+      }
+
+      try {
+        await bot.placeBlock(standOnBlock, new Vec3(0, 1, 0));
+        placed++;
+      } catch (err) {
+        bot.setControlState('jump', false);
+        const message = err instanceof Error ? err.message : String(err);
+        return placed
+          ? `Built up ${placed}/${levels}; next place failed: ${message}`
+          : `Failed to place scaffold below me: ${message}`;
+      }
+
+      await this.waitUntil(() => bot.entity!.onGround, 1600, 50);
+      bot.setControlState('jump', false);
+      await this.sleep(150);
+    }
+
+    const p = bot.entity!.position;
+    return `Built up ${placed} block(s); now at (${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)})`;
+  }
+
   private makeVec3(x: number, y: number, z: number) {
     if (!this.bot.entity) throw new Error('Bot not spawned');
     const v = this.bot.entity.position.clone();
@@ -1728,16 +1899,21 @@ export class MinecraftAgent {
   private navigateTo(x: number, y: number, z: number, range = 1, timeoutMs = 60000): Promise<void> {
     const bot = this.bot;
     return new Promise((resolve, reject) => {
+      const navId = ++this.navigationSeq;
+      this.activeFollowGoal = null;
+      this.activeNavigationGoal = { id: navId, x, y, z, range };
       bot.pathfinder.setMovements(this.getMovements());
 
       const timeoutId = setTimeout(() => {
         bot.removeListener('goal_reached', onReached);
+        if (this.activeNavigationGoal?.id === navId) this.activeNavigationGoal = null;
         bot.pathfinder.stop();
         reject(new Error('Navigation timed out'));
       }, timeoutMs);
 
       const onReached = () => {
         clearTimeout(timeoutId);
+        if (this.activeNavigationGoal?.id === navId) this.activeNavigationGoal = null;
         resolve();
       };
 
@@ -2024,12 +2200,16 @@ export class MinecraftAgent {
         const { username, range = 2 } = args as { username: string; range?: number };
         const target = bot.players[username]?.entity;
         if (!target) return `Cannot see player: ${username}`;
+        this.activeNavigationGoal = null;
+        this.activeFollowGoal = { username, range: range as number };
         bot.pathfinder.setMovements(this.getMovements());
         bot.pathfinder.setGoal(new goals.GoalFollow(target, range as number), true);
         return `Following ${username}`;
       }
 
       case 'stop_moving': {
+        this.activeNavigationGoal = null;
+        this.activeFollowGoal = null;
         bot.pathfinder.stop();
         bot.clearControlStates();
         return 'Stopped moving';
@@ -2046,6 +2226,11 @@ export class MinecraftAgent {
         await new Promise<void>(r => setTimeout(r, 250));
         bot.setControlState('jump', false);
         return 'Jumped';
+      }
+
+      case 'build_up': {
+        const { height = 1, block_name } = args as { height?: number; block_name?: string };
+        return this.buildUp(height as number, block_name);
       }
 
       case 'get_health': {
@@ -2211,6 +2396,8 @@ export class MinecraftAgent {
           return dist <= (max_distance as number) && label.includes(entity_name.toLowerCase());
         });
         if (!target) return `No ${entity_name} found within ${max_distance} blocks`;
+        this.activeNavigationGoal = null;
+        this.activeFollowGoal = null;
         const dist = bot.entity.position.distanceTo(target.position);
         if (dist > 3) await this.navigateTo(target.position.x, target.position.y, target.position.z, 2, 15000);
         await bot.lookAt(target.position.offset(0, (target.height ?? 1) * 0.9, 0));
@@ -2227,6 +2414,8 @@ export class MinecraftAgent {
           return dist <= (max_distance as number) && label.includes(entity_name.toLowerCase());
         });
         if (!target) return `No ${entity_name} found within ${max_distance} blocks`;
+        this.activeNavigationGoal = null;
+        this.activeFollowGoal = null;
 
         const weapons = bot.inventory.items().filter(i => i.name.includes('sword') || i.name.includes('axe'));
         if (weapons.length) await bot.equip(weapons[0], 'hand');

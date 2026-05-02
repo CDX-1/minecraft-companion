@@ -151,7 +151,7 @@ export function launchUI(config: BotConfig): void {
       const botAny = bot as any;
       botAny.autoEat?.setOpts?.({
         minHunger: 15,
-        minHealth: 14,
+        minHealth: 6,
         returnToLastItem: true,
       });
       botAny.autoEat?.enableAuto?.();
