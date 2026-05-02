@@ -1,5 +1,6 @@
 import blessed from 'blessed';
 import mineflayer, { Bot } from 'mineflayer';
+import { pathfinder, Movements, goals } from 'mineflayer-pathfinder';
 import { parseChatCommand } from './commands';
 import { BotConfig } from './config';
 
@@ -66,17 +67,8 @@ export function launchUI(config: BotConfig): void {
   // ── Bot ───────────────────────────────────────────────────
   let bot: Bot;
   let infoTimer: NodeJS.Timeout | null = null;
-  let followTimer: NodeJS.Timeout | null = null;
 
-  function stopFollowing() {
-    if (followTimer) {
-      clearInterval(followTimer);
-      followTimer = null;
-    }
-
-    bot?.setControlState('forward', false);
-    bot?.setControlState('sprint', false);
-  }
+  const FOLLOW_RANGE = 2;
 
   function followPlayer(username: string) {
     const target = bot.players[username]?.entity;
@@ -88,24 +80,12 @@ export function launchUI(config: BotConfig): void {
       return;
     }
 
-    stopFollowing();
     bot.chat('Following you.');
     chatLog.log(`{green-fg}[bot] Following ${username}.{/green-fg}`);
     screen.render();
 
-    followTimer = setInterval(() => {
-      const currentTarget = bot.players[username]?.entity;
-
-      if (!currentTarget) {
-        stopFollowing();
-        return;
-      }
-
-      const distance = bot.entity.position.distanceTo(currentTarget.position);
-      bot.lookAt(currentTarget.position.offset(0, currentTarget.height, 0), true).catch(() => undefined);
-      bot.setControlState('forward', distance > 2);
-      bot.setControlState('sprint', distance > 4);
-    }, 250);
+    bot.pathfinder.setMovements(new Movements(bot));
+    bot.pathfinder.setGoal(new goals.GoalFollow(target, FOLLOW_RANGE), true);
   }
 
   function renderInfo() {
@@ -130,6 +110,8 @@ export function launchUI(config: BotConfig): void {
       username: config.username,
       auth: config.auth,
     });
+
+    bot.loadPlugin(pathfinder);
 
     bot.once('spawn', () => {
       statusBar.setContent(`  Connected · ${bot.username} @ ${config.host}:${config.port}`);
@@ -164,7 +146,6 @@ export function launchUI(config: BotConfig): void {
 
     bot.on('end', (reason) => {
       if (infoTimer) clearInterval(infoTimer);
-      stopFollowing();
       chatLog.log(`{yellow-fg}[system] Disconnected: ${reason}{/yellow-fg}`);
       statusBar.setContent(`  Disconnected: ${reason}`);
       statusBar.style.bg = 'red';

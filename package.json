@@ -24,7 +24,8 @@
     "blessed": "^0.1.81",
     "dotenv": "^17.4.2",
     "inquirer": "^8.2.7",
-    "mineflayer": "^4.37.0"
+    "mineflayer": "^4.37.0",
+    "mineflayer-pathfinder": "^2.4.5"
   },
   "devDependencies": {
     "@types/blessed": "^0.1.27",

@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import mineflayer, { Bot } from 'mineflayer';
+import { pathfinder, Movements, goals } from 'mineflayer-pathfinder';
 import { parseChatCommand } from './commands';
 
 const bot: Bot = mineflayer.createBot({
@@ -9,17 +10,9 @@ const bot: Bot = mineflayer.createBot({
   // auth: 'microsoft', // uncomment for online-mode servers
 });
 
-let followTimer: NodeJS.Timeout | null = null;
+bot.loadPlugin(pathfinder);
 
-function stopFollowing(): void {
-  if (followTimer) {
-    clearInterval(followTimer);
-    followTimer = null;
-  }
-
-  bot.setControlState('forward', false);
-  bot.setControlState('sprint', false);
-}
+const FOLLOW_RANGE = 2;
 
 function followPlayer(username: string): void {
   const target = bot.players[username]?.entity;
@@ -29,22 +22,9 @@ function followPlayer(username: string): void {
     return;
   }
 
-  stopFollowing();
   bot.chat('Following you.');
-
-  followTimer = setInterval(() => {
-    const currentTarget = bot.players[username]?.entity;
-
-    if (!currentTarget) {
-      stopFollowing();
-      return;
-    }
-
-    const distance = bot.entity.position.distanceTo(currentTarget.position);
-    bot.lookAt(currentTarget.position.offset(0, currentTarget.height, 0), true).catch(() => undefined);
-    bot.setControlState('forward', distance > 2);
-    bot.setControlState('sprint', distance > 4);
-  }, 250);
+  bot.pathfinder.setMovements(new Movements(bot));
+  bot.pathfinder.setGoal(new goals.GoalFollow(target, FOLLOW_RANGE), true);
 }
 
 bot.once('spawn', () => {
@@ -71,6 +51,5 @@ bot.on('error', (err) => {
 });
 
 bot.on('end', (reason) => {
-  stopFollowing();
   console.log('[bot] disconnected:', reason);
 });
