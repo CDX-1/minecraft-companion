@@ -10,6 +10,8 @@ export interface BlockPlacement {
   block: string;
 }
 
+export type BuildOperation = BlockPlacement;
+
 export interface Origin {
   x: number;
   y: number;
@@ -50,11 +52,49 @@ export interface BuildStatus {
   message?: string;
 }
 
+export type BuildOperationExecutor = (
+  ops: BuildOperation[],
+  onPlaced: (placed: number) => void,
+  context: { origin?: { x: number; y: number; z: number } },
+) => Promise<boolean>;
+
 export interface BuildSessionOptions {
   frameDelayMs?: number;
   blocksPerFrame?: number;
   flyAlong?: boolean;
   maxFoundationDrop?: number;
+  executor?: BuildOperationExecutor;
+}
+
+type ResolvedBuildSessionOptions = Required<Omit<BuildSessionOptions, 'executor'>> & {
+  executor?: BuildOperationExecutor;
+};
+
+export function planBuildTransition(old: PlacedBuild | null, next: PlacedBuild | null): BuildOperation[] {
+  const oldMap = new Map<string, BlockPlacement>();
+  if (old) for (const b of old.blocks) oldMap.set(key(b), b);
+  const nextMap = new Map<string, BlockPlacement>();
+  if (next) for (const b of next.blocks) nextMap.set(key(b), b);
+
+  const toClear: BlockPlacement[] = [];
+  for (const [k, b] of oldMap) {
+    const nb = nextMap.get(k);
+    if (!nb || nb.block !== b.block) {
+      if (!b.block.includes('air')) {
+        toClear.push({ x: b.x, y: b.y, z: b.z, block: 'minecraft:air' });
+      }
+    }
+  }
+
+  const toPlace: BlockPlacement[] = [];
+  for (const [k, b] of nextMap) {
+    const ob = oldMap.get(k);
+    if (!ob || ob.block !== b.block) toPlace.push(b);
+  }
+
+  toClear.sort((a, b) => b.y - a.y || a.x - b.x || a.z - b.z);
+  toPlace.sort((a, b) => a.y - b.y || a.x - b.x || a.z - b.z);
+  return [...toClear, ...toPlace];
 }
 
 export class BuildSession {
@@ -62,7 +102,7 @@ export class BuildSession {
   private status: BuildStatus = emptyStatus();
   private buildAbort = false;
   private buildInFlight: Promise<BuildStatus> | null = null;
-  private readonly opts: Required<BuildSessionOptions>;
+  private readonly opts: ResolvedBuildSessionOptions;
 
   constructor(
     private bot: Bot,
@@ -75,6 +115,7 @@ export class BuildSession {
       blocksPerFrame: opts.blocksPerFrame ?? 1,
       flyAlong: opts.flyAlong ?? true,
       maxFoundationDrop: opts.maxFoundationDrop ?? 24,
+      executor: opts.executor,
     };
     this.activeFrameDelayMs = this.opts.frameDelayMs;
   }
@@ -271,6 +312,24 @@ export class BuildSession {
     const run = (async (): Promise<BuildStatus> => {
       try {
         const { blocksPerFrame } = this.opts;
+        if (this.opts.executor) {
+          const handled = await this.opts.executor(
+            ops,
+            placed => {
+              this.status.placed = Math.max(0, Math.min(ops.length, placed));
+              onProgress?.(this.getStatus());
+            },
+            { origin: this.bot.entity?.position },
+          );
+          if (handled) {
+            this.status.placed = ops.length;
+            this.status.phase = 'done';
+            this.status.message = next ? `Built ${next.description}` : 'Demolished';
+            onProgress?.(this.getStatus());
+            return this.getStatus();
+          }
+        }
+
         const hoverY = (next?.bounds?.max.y ?? old?.bounds?.max.y ?? 64) + 4;
         let executed = 0;
         for (let i = 0; i < ops.length; i += blocksPerFrame) {

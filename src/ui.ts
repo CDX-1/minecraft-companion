@@ -491,7 +491,19 @@ export function launchUI(config: BotConfig): void {
       if (openaiApiKey) {
         agent = new MinecraftAgent(
           bot,
-          { provider: 'openai', apiKey: openaiApiKey, personality: config.personality },
+          {
+            provider: 'openai',
+            apiKey: openaiApiKey,
+            personality: config.personality,
+            buildCrew: {
+              enabled: config.buildCrewEnabled,
+              host: config.host,
+              port: config.port,
+              auth: config.auth,
+              mainUsername: config.username,
+              size: config.buildCrewSize,
+            },
+          },
           (msg) => {
             logAgent(msg);
           },

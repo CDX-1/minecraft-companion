@@ -23,7 +23,6 @@ function createAgentHarness() {
     bot,
     { provider: 'gemini', apiKey: 'test' },
     () => {},
-    () => {},
   );
   (agent as any).movements = {};
 

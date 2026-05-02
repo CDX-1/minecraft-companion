@@ -6,6 +6,7 @@ import { Movements, goals } from 'mineflayer-pathfinder';
 import { Vec3 } from 'vec3';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
 import { BuildSession, BuildStatus, rotateBlockState } from './services/builder';
+import { BuilderCrewSession } from './services/builderCrew';
 import { buildFromPrompt, GeneratedBuild } from './services/geminiBuilder';
 import { MemoryManager } from './agent/MemoryManager';
 import { StateMachine } from './agent/StateMachine';
@@ -1113,7 +1114,31 @@ export class MinecraftAgent {
       this.openai = new OpenAI({ apiKey: this.apiKey });
     }
 
-    this.builder = new BuildSession(bot, log);
+    const buildCrew = resolvedOptions.buildCrew?.enabled
+      ? new BuilderCrewSession({
+          host: resolvedOptions.buildCrew.host,
+          port: resolvedOptions.buildCrew.port,
+          auth: resolvedOptions.buildCrew.auth,
+          mainUsername: resolvedOptions.buildCrew.mainUsername,
+          crewSize: resolvedOptions.buildCrew.size,
+          frameDelayMs: 100,
+          commandBot: bot,
+          log,
+        })
+      : null;
+
+    this.builder = new BuildSession(bot, log, buildCrew ? {
+      flyAlong: false,
+      executor: async (ops, onPlaced, context) => {
+        try {
+          await buildCrew.run(ops, status => onPlaced(status.placed), context.origin);
+          return true;
+        } catch (err) {
+          log(`[build-crew] failed, falling back to solo builder: ${err instanceof Error ? err.message : String(err)}`);
+          return false;
+        }
+      },
+    } : {});
     this.onBuildStatus = onBuildStatus;
 
     this.memoryManager = new MemoryManager(this.log.bind(this));

@@ -8,6 +8,14 @@ export interface MinecraftAgentOptions {
   geminiModel?: string;
   personality?: Personality;
   ownerUsername?: string;
+  buildCrew?: {
+    enabled: boolean;
+    host: string;
+    port: number;
+    auth: 'offline' | 'microsoft';
+    mainUsername: string;
+    size: number;
+  };
 }
 
 export type GeminiPart = {

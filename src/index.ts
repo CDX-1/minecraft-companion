@@ -26,6 +26,10 @@ async function main() {
     : true;
   const envElevenLabsLatency = Math.max(0, Math.min(4, Number(process.env.ELEVENLABS_LATENCY) || 4));
   const memoryOwnerUsername = readOwnerUsernameFromMemory();
+  const envBuildCrewEnabled = process.env.BUILD_CREW_ENABLED
+    ? process.env.BUILD_CREW_ENABLED === 'true'
+    : true;
+  const envBuildCrewSize = Math.max(1, Math.min(8, Number(process.env.BUILD_CREW_SIZE) || 4));
 
   const answers = await inquirer.prompt([
     {
@@ -81,6 +85,19 @@ async function main() {
         { name: 'Microsoft (premium)', value: 'microsoft' },
       ],
       default: 'offline',
+    },
+    {
+      type: 'confirm',
+      name: 'buildCrewEnabled',
+      message: 'Use temporary helper bots for builds?',
+      default: envBuildCrewEnabled,
+    },
+    {
+      type: 'number',
+      name: 'buildCrewSize',
+      message: 'Build helper bot count:',
+      default: envBuildCrewSize,
+      when: (answers) => answers.buildCrewEnabled,
     },
     {
       type: 'confirm',
@@ -155,6 +172,8 @@ async function main() {
     elevenLabsSimilarityBoost: envElevenLabsSimilarityBoost ?? answers.elevenLabsSimilarityBoost,
     elevenLabsStreaming: envElevenLabsStreaming,
     elevenLabsLatency: envElevenLabsLatency,
+    buildCrewEnabled: answers.buildCrewEnabled ?? envBuildCrewEnabled,
+    buildCrewSize: Math.max(1, Math.min(8, Number(answers.buildCrewSize) || envBuildCrewSize)),
   };
 
   launchUI(config);

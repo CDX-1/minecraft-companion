@@ -18,4 +18,6 @@ export interface BotConfig {
   elevenLabsSimilarityBoost: number;
   elevenLabsStreaming: boolean;
   elevenLabsLatency: number;
+  buildCrewEnabled: boolean;
+  buildCrewSize: number;
 }
