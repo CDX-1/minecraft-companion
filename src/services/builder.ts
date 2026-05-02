@@ -228,9 +228,23 @@ export class BuildSession {
       if (!ob || ob.block !== b.block) toPlace.push(b);
     }
 
+    const terrainClear: BlockPlacement[] = [];
+    for (const b of toPlace) {
+      if (b.block.includes('air')) continue;
+      const k = key(b);
+      if (oldMap.has(k)) continue; // already handled by toClear
+      const existing = this.bot.blockAt(makeVec3(b.x, b.y, b.z) as Parameters<Bot['blockAt']>[0]);
+      if (!existing) continue;
+      const name = existing.name;
+      if (name === 'air' || name === 'cave_air' || name === 'void_air') continue;
+      if ((existing as { boundingBox?: string }).boundingBox === 'empty') continue;
+      terrainClear.push({ x: b.x, y: b.y, z: b.z, block: 'minecraft:air' });
+    }
+
     toClear.sort((a, b) => b.y - a.y || a.x - b.x || a.z - b.z);
+    terrainClear.sort((a, b) => b.y - a.y || a.x - b.x || a.z - b.z);
     toPlace.sort((a, b) => a.y - b.y || a.x - b.x || a.z - b.z);
-    const ops: BlockPlacement[] = [...toClear, ...toPlace];
+    const ops: BlockPlacement[] = [...toClear, ...terrainClear, ...toPlace];
 
     this.current = next;
     this.status = {
