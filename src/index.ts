@@ -88,7 +88,7 @@ const PERSONALITIES: PersonalityDef[] = [
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 const SKIN_WIDTH = 12;
-const TOTAL_STEPS = 4;
+const TOTAL_STEPS = 5;
 
 function sanitizeMcUsername(name: string, fallback: string): string {
   const cleaned = name.replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 16);
@@ -448,6 +448,118 @@ async function askSkin(): Promise<SkinUsername | undefined> {
   });
 }
 
+// ── Voice definitions ─────────────────────────────────────────────────────────
+
+interface VoiceDef {
+  name: string;
+  id: string;
+  tagline: string;
+  color: string;
+  glyph: string;
+}
+
+const VOICES: VoiceDef[] = [
+  { name: 'Natasha',  id: 'PB6BdkFkZLbI39GHdnbQ', tagline: 'Warm & expressive',       color: C.pink,   glyph: '♦' },
+  { name: 'Serafina', id: '4tRn1lSkEn13EVTuqb0g', tagline: 'Ethereal & melodic',       color: C.violet, glyph: '✦' },
+  { name: 'Michael',  id: 'uju3wxzG5OhpWcoi3SMy', tagline: 'Deep & authoritative',      color: C.accent, glyph: '◆' },
+  { name: 'Edward',   id: 'goT3UYdM9bhm0n2lmKQx', tagline: 'Smooth & conversational',  color: C.amber,  glyph: '✧' },
+];
+
+// ── Step 5: Voice ─────────────────────────────────────────────────────────────
+
+function renderVoiceCard(v: VoiceDef, selected: boolean): string[] {
+  const width = 56;
+  const border = selected ? v.color : C.faint;
+  const cornerTL = selected ? '╭' : '┌';
+  const cornerTR = selected ? '╮' : '┐';
+  const cornerBL = selected ? '╰' : '└';
+  const cornerBR = selected ? '╯' : '┘';
+
+  const titleLine = selected
+    ? `${C.bold}${v.color}${v.glyph}  ${v.name}${C.reset}  ${C.muted}${v.tagline}${C.reset}`
+    : `${v.color}${v.glyph}${C.reset}  ${C.ink}${v.name}${C.reset}  ${C.faint}${v.tagline}${C.reset}`;
+
+  const lines: string[] = [];
+  lines.push(`${border}${cornerTL}${'─'.repeat(width - 2)}${cornerTR}${C.reset}`);
+  lines.push(`${border}│${C.reset} ${pad(titleLine, width - 4)} ${border}│${C.reset}`);
+  lines.push(`${border}│${C.reset} ${' '.repeat(width - 4)} ${border}│${C.reset}`);
+  lines.push(`${border}${cornerBL}${'─'.repeat(width - 2)}${cornerBR}${C.reset}`);
+  return lines;
+}
+
+async function askVoice(): Promise<VoiceDef | undefined> {
+  stepHeader(5, 'Choose their voice');
+
+  const hasApiKey = !!process.env.ELEVENLABS_API_KEY?.trim();
+  if (hasApiKey) {
+    console.log(`  ${C.faint}Use ${C.reset}${C.accent}← →${C.reset}${C.faint} to browse, ${C.reset}${C.accent}Enter${C.reset}${C.faint} to pick. Press ${C.reset}${C.accent}s${C.reset}${C.faint} to skip.${C.reset}`);
+  } else {
+    console.log(`  ${C.amber}No ELEVENLABS_API_KEY found — voice synthesis will be disabled.${C.reset}`);
+    console.log(`  ${C.faint}You can still pick a voice for when you add a key later, or press ${C.reset}${C.accent}s${C.reset}${C.faint} to skip.${C.reset}`);
+  }
+
+  let idx = 0;
+  let renderedLineCount = 0;
+
+  function tabs(): string {
+    return VOICES.map((v, i) => {
+      if (i === idx) return `${C.accentBg} ${v.glyph} ${v.name} ${C.reset}`;
+      return ` ${C.faint}${v.glyph}${C.reset} ${C.muted}${v.name}${C.reset} `;
+    }).join(`${C.faint} · ${C.reset}`);
+  }
+
+  function render() {
+    if (renderedLineCount > 0) clearLines(renderedLineCount);
+    const out: string[] = [];
+    out.push('');
+    out.push('  ' + tabs());
+    out.push('');
+    const card = renderVoiceCard(VOICES[idx], true);
+    for (const l of card) out.push('  ' + l);
+    out.push('');
+    const text = out.join('\n') + '\n';
+    process.stdout.write(text);
+    renderedLineCount = text.split('\n').length - 1;
+  }
+
+  return new Promise<VoiceDef | undefined>((resolve) => {
+    render();
+    readline.emitKeypressEvents(process.stdin);
+    if (process.stdin.isTTY) process.stdin.setRawMode(true);
+
+    const onKey = (_: string, key: readline.Key) => {
+      if (!key) return;
+      if (key.name === 'right') {
+        idx = (idx + 1) % VOICES.length;
+        render();
+      } else if (key.name === 'left') {
+        idx = (idx - 1 + VOICES.length) % VOICES.length;
+        render();
+      } else if (key.name === 'return' || key.name === 'enter') {
+        if (renderedLineCount > 0) clearLines(renderedLineCount);
+        if (process.stdin.isTTY) process.stdin.setRawMode(false);
+        process.stdin.removeListener('keypress', onKey);
+        process.stdin.pause();
+        const chosen = VOICES[idx];
+        console.log(`  ${C.accent}✓${C.reset} ${C.ink}voice set to${C.reset} ${C.bold}${chosen.color}${chosen.name}${C.reset}`);
+        resolve(chosen);
+      } else if (key.name === 's' || key.name === 'escape') {
+        if (renderedLineCount > 0) clearLines(renderedLineCount);
+        if (process.stdin.isTTY) process.stdin.setRawMode(false);
+        process.stdin.removeListener('keypress', onKey);
+        process.stdin.pause();
+        console.log(`  ${C.muted}voice skipped — synthesis disabled${C.reset}`);
+        resolve(undefined);
+      } else if (key.name === 'c' && key.ctrl) {
+        process.exit(0);
+      }
+    };
+
+    process.stdin.on('keypress', onKey);
+    process.stdin.resume();
+  });
+}
+
 // ── Confirmation card ────────────────────────────────────────────────────────
 
 function renderSummary(opts: {
@@ -455,6 +567,7 @@ function renderSummary(opts: {
   bio: string;
   personality: Personality;
   skin: SkinUsername | undefined;
+  voice: VoiceDef | undefined;
 }) {
   const p = PERSONALITIES.find((x) => x.key === opts.personality)!;
   const width = 56;
@@ -468,6 +581,7 @@ function renderSummary(opts: {
     ['name', opts.name || `${C.faint}(default)${C.reset}`],
     ['personality', `${p.color}${p.glyph}${C.reset} ${C.ink}${p.label}${C.reset}`],
     ['skin', opts.skin ? `${C.ink}${opts.skin}${C.reset}` : `${C.faint}default${C.reset}`],
+    ['voice', opts.voice ? `${opts.voice.color}${opts.voice.glyph}${C.reset} ${C.ink}${opts.voice.name}${C.reset}` : `${C.faint}disabled${C.reset}`],
   ];
   for (const [k, v] of rows) {
     const line = `  ${C.muted}${pad(k, 14)}${C.reset}${v}`;
@@ -500,15 +614,16 @@ async function main() {
   const bio = await askBackstory();
   const personality = await askPersonality();
   const skin = await askSkin();
+  const voice = await askVoice();
 
-  renderSummary({ name, bio, personality, skin });
+  renderSummary({ name, bio, personality, skin, voice });
 
   // ── Tech config from env vars ──
   const memoryOwnerUsername = readOwnerUsernameFromMemory();
 
-  const elevenLabsEnabled = process.env.ELEVENLABS_ENABLED === 'true';
   const elevenLabsApiKey = process.env.ELEVENLABS_API_KEY?.trim();
-  const elevenLabsVoiceId = process.env.ELEVENLABS_VOICE_ID?.trim();
+  const elevenLabsVoiceId = voice?.id;
+  const elevenLabsEnabled = !!voice && !!elevenLabsApiKey;
   const elevenLabsModelId = process.env.ELEVENLABS_MODEL_ID?.trim() || 'eleven_turbo_v2_5';
   const elevenLabsStability = Number(process.env.ELEVENLABS_STABILITY) || 0.4;
   const elevenLabsSimilarityBoost = Number(process.env.ELEVENLABS_SIMILARITY_BOOST) || 0.75;
