@@ -11,14 +11,6 @@ import { buildFromPrompt, editFromPrompt, findNearestBuild, listStoredBuilds, Ge
 import { MemoryManager } from './agent/MemoryManager';
 import { StateMachine } from './agent/StateMachine';
 
-function looksLikeBuildIntent(message: string): boolean {
-  return /\b(build|construct|erect|put up|create me|design me|make me a|spawn me a|tower|house|castle|villa|mansion|dome|sphere|pyramid|wall|bridge|arch|cube|staircase|obelisk|fountain|temple|shrine|cathedral|church|cottage|dock|pier|statue|monument|sakura|cherry blossom|dragon|death star)\b/i.test(message);
-}
-
-function looksLikeEditIntent(message: string): boolean {
-  return /\b(make it|change it|modify|edit|tweak|adjust|refine|update it|turn (this|that|it) into|add (a|an|some|more)|remove (the|a|some)|swap|replace (the|its)|taller|shorter|wider|narrower|bigger|smaller|larger|expand|shrink|more (windows|doors|detail|trim)|fewer)\b/i.test(message);
-}
-
 const BUILD_VOICELINES: Record<Personality, {
   ack: string[];
   start: string[];
@@ -63,6 +55,45 @@ const BUILD_VOICELINES: Record<Personality, {
 
 function pickLine(lines: string[]): string {
   return lines[Math.floor(Math.random() * lines.length)] ?? '';
+}
+
+/**
+ * Throttled progress-line dispatcher. Fires `start` once on first non-zero
+ * progress, then `mid`/`detail` every MIN_GAP_MS (independent of how many
+ * tiny passes the build flickers through) — prevents the "three lines in a
+ * row at the start, then silence" failure mode where many BuildStatus
+ * resets each cross 25/50/75% in quick succession.
+ */
+function makeBuildLineSpeaker(
+  fire: (moment: 'start' | 'mid' | 'detail', placed: number, total: number) => void,
+  opts: { minGapMs?: number } = {},
+) {
+  const minGap = opts.minGapMs ?? 8000;
+  let started = false;
+  let lastAt = 0;
+  let detailFired = false;
+  return (placed: number, total: number): void => {
+    if (placed <= 0) return;
+    const now = Date.now();
+    if (!started) {
+      started = true;
+      lastAt = now;
+      fire('start', placed, total);
+      return;
+    }
+    if (now - lastAt < minGap) return;
+    if (total > 0) {
+      const frac = placed / total;
+      if (frac >= 0.75 && !detailFired) {
+        detailFired = true;
+        lastAt = now;
+        fire('detail', placed, total);
+        return;
+      }
+    }
+    lastAt = now;
+    fire('mid', placed, total);
+  };
 }
 
 import {
@@ -200,7 +231,9 @@ TOOL SELECTION GUIDE:
 - Inventory pressure: if Inv shows 32+/36 slots used, warn the player and suggest depositing to a nearby chest
 
 BUILDING:
-Build requests ("build a castle", "make me a tower") are handled OUTSIDE your tool loop by a dedicated Gemini-powered pipeline that generates a schematic and places it. You will not see those requests — they are intercepted before reaching you.
+- start_build: when the player asks for a NEW structure ("build a castle", "make me a tower", "put up a watchtower", "design me a villa"). Pass the FULL request as the prompt. The build runs in the background — you reply ONCE in your own voice (a personal reaction to what they asked for: react to the style, the material, the vibe), then the tool fires.
+- edit_build: when the player wants to MODIFY the structure they're standing near ("make it taller", "swap to deepslate", "add windows", "more arches"). Pass the FULL change request as the prompt.
+- Reply with a unique, in-character one-liner that reacts to THIS specific request — don't just say "on it". Reference what they asked for. The build kicks off automatically after your reply; do not announce progress, the system handles that.
 - build_demolish removes the active structure. build_cancel aborts an in-flight build (use if user says "stop" mid-build).
 - quick_setblock / quick_fill / quick_clear are for one-off ops (single block, region fill, clearing space) — NEVER use them for full structures.
 - All build tools require the bot to be op (server operator). If commands fail, tell the player to /op the bot.
@@ -1016,6 +1049,34 @@ const TOOLS: ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
+      name: 'start_build',
+      description: 'Kick off a Gemini-powered build of a NEW structure for the player. The build runs in the background — call this once and let it work. Use for any new-structure request (tower, castle, villa, dome, statue, bridge, anything).',
+      parameters: {
+        type: 'object',
+        required: ['prompt'],
+        properties: {
+          prompt: { type: 'string', description: "The player's full build request, verbatim (e.g. \"build a brutalist watchtower out of deepslate\")." },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'edit_build',
+      description: 'Modify the most recently placed structure near the player. Use when they want a change to an EXISTING build ("make it taller", "swap to quartz", "add windows", "more arches"). Runs in the background.',
+      parameters: {
+        type: 'object',
+        required: ['prompt'],
+        properties: {
+          prompt: { type: 'string', description: "The player's full edit request, verbatim." },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'build_demolish',
       description: 'Tear down the active structure (clears its blocks to air) and forget it. Use when the player says "delete it", "tear it down", "remove that".',
       parameters: { type: 'object', properties: {} },
@@ -1369,34 +1430,6 @@ export class MinecraftAgent {
     this.log(`[personality] active: ${this.personality}`);
     try {
       this.currentSender = sender;
-      if (looksLikeEditIntent(message)) {
-        const playerEntity = this.bot.players[sender]?.entity;
-        const refPos = playerEntity?.position ?? this.bot.entity?.position;
-        if (refPos) {
-          const nearest = await findNearestBuild({ x: refPos.x, y: refPos.y, z: refPos.z });
-          if (nearest) {
-            this.currentSender = sender;
-            const lines = BUILD_VOICELINES[this.personality];
-            void this.runGeminiEdit(nearest.id, message).catch(err => {
-              const msg = err instanceof Error ? err.message : String(err);
-              this.log(`[gemini-edit] failed: ${msg}`);
-              this.onAutonomousMessage?.(pickLine(lines.fail));
-            });
-            return pickLine(lines.ack);
-          }
-        }
-      }
-
-      if (looksLikeBuildIntent(message)) {
-        this.currentSender = sender;
-        const lines = BUILD_VOICELINES[this.personality];
-        void this.runGeminiBuild(message, sender).catch(err => {
-          const msg = err instanceof Error ? err.message : String(err);
-          this.log(`[gemini-build] failed: ${msg}`);
-          this.onAutonomousMessage?.(pickLine(lines.fail));
-        });
-        return pickLine(lines.ack);
-      }
 
       const bot = this.bot;
       const pos = bot.entity?.position;
@@ -2158,6 +2191,68 @@ export class MinecraftAgent {
     return `Built up ${placed} block(s); now at (${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)})`;
   }
 
+  /**
+   * Generate a personality-flavored, context-aware one-liner for a build
+   * milestone. Falls back to the static voiceline pool if the LLM call fails
+   * or returns nothing usable.
+   *
+   * Building must NOT block on this — callers should `void` the promise.
+   */
+  private async speakBuildLine(
+    moment: 'start' | 'mid' | 'detail' | 'done' | 'cancelled' | 'fail',
+    ctx: { prompt?: string; description?: string; placed?: number; total?: number; mode?: 'build' | 'edit'; errorMessage?: string },
+  ): Promise<void> {
+    const fallbackPool = BUILD_VOICELINES[this.personality];
+    const fallback = fallbackPool[moment === 'detail' ? 'mid' : moment] ?? fallbackPool.mid;
+    const fallbackLine = pickLine(fallback);
+
+    try {
+      if (!this.openai) {
+        this.onAutonomousMessage?.(fallbackLine);
+        return;
+      }
+
+      const momentBrief: Record<typeof moment, string> = {
+        start: "you JUST started laying it down — first blocks are appearing",
+        mid: "you're roughly halfway through the build — making real progress",
+        detail: "you're past 75%, polishing the final details now",
+        done: "you JUST finished the build — step back and present it",
+        cancelled: "the build was stopped mid-way",
+        fail: "the build pipeline errored out",
+      } as const;
+
+      const pct = ctx.total && ctx.total > 0 ? Math.round(((ctx.placed ?? 0) / ctx.total) * 100) : null;
+      const buildContext = [
+        ctx.prompt ? `Player asked for: "${ctx.prompt}"` : '',
+        ctx.description ? `Current build: ${ctx.description}` : '',
+        pct !== null ? `Progress: ${pct}%` : '',
+        ctx.mode === 'edit' ? 'This is an EDIT to an existing structure, not a new build.' : '',
+        ctx.errorMessage ? `Error detail (do NOT quote it verbatim): ${ctx.errorMessage}` : '',
+      ].filter(Boolean).join('\n');
+
+      const sysPrompt = `${PERSONA_PROMPTS[this.personality]}
+
+You are mid-build, talking to your friend while you work. Right now: ${momentBrief[moment]}.
+Reply with ONE short, in-character line (under 100 chars) that reacts to THIS specific build — react to the shape, style, or vibe of what they asked for. Do NOT mention specific block names or materials. Don't repeat yourself, don't sound like a status bar, don't say "on it" or "starting now" — say something a real person watching themselves work would say. No quotes, no prefixes, just the line.`;
+
+      const response = await this.openai.chat.completions.create({
+        model: this.openaiModel,
+        messages: [
+          { role: 'system', content: sysPrompt },
+          { role: 'user', content: buildContext || 'No extra context — just react in character.' },
+        ],
+        max_tokens: 60,
+        temperature: 0.95,
+      });
+      const text = response.choices[0]?.message?.content?.trim().replace(/^["']|["']$/g, '') ?? '';
+      const finalLine = text.length > 0 && text.length <= 140 ? text : fallbackLine;
+      this.onAutonomousMessage?.(finalLine);
+    } catch (err) {
+      this.log(`[build-line] llm failed: ${err instanceof Error ? err.message : String(err)}`);
+      this.onAutonomousMessage?.(fallbackLine);
+    }
+  }
+
   private async runGeminiBuild(message: string, sender: string): Promise<string> {
     const bot = this.bot;
     const playerEntity = bot.players[sender]?.entity;
@@ -2165,7 +2260,6 @@ export class MinecraftAgent {
       ? { position: { x: playerEntity.position.x, y: playerEntity.position.y, z: playerEntity.position.z }, yaw: playerEntity.yaw }
       : undefined;
 
-    const lines = BUILD_VOICELINES[this.personality];
     this.log(`[gemini-build] generating: "${message}"`);
 
     // Lock origin from the first pass so all passes render in the same spot
@@ -2191,12 +2285,21 @@ export class MinecraftAgent {
       });
     };
 
-    // Streaming render: each pass kicks off a replay immediately and we DON'T
-    // await it. When the next pass arrives, we cancel the in-flight render and
-    // start the next one — BuildSession.applyTransition diffs against whatever
-    // got placed so far, so it just keeps editing the structure live.
-    let announcedStart = false;
-    let announcedMid = false;
+    // Throttled progress quips. Generation runs detached (`void`) so block
+    // placement is never blocked by the LLM call or downstream voice synth.
+    // The throttle prevents bursting all milestones at once when an early
+    // pass (small massing render) crosses every threshold quickly.
+    let lastDescription = '';
+    const speakWithGap = makeBuildLineSpeaker(
+      (moment, placed, total) => void this.speakBuildLine(moment, {
+        prompt: message,
+        description: lastDescription,
+        placed,
+        total,
+        mode: 'build',
+      }),
+    );
+
     let finalArrived = false;
     // ~12 blocks/sec base, stretching up to ~2 blocks/sec if the final pass
     // is slow and we're nearing the end of the massing render.
@@ -2205,14 +2308,7 @@ export class MinecraftAgent {
     const onReplayProgress = (s: BuildStatus): void => {
       this.onBuildStatus?.(s);
       if (s.phase !== 'building') return;
-      if (!announcedStart && s.placed > 0) {
-        announcedStart = true;
-        this.onAutonomousMessage?.(pickLine(lines.start));
-      }
-      if (!announcedMid && s.total > 0 && s.placed / s.total >= 0.5) {
-        announcedMid = true;
-        this.onAutonomousMessage?.(pickLine(lines.mid));
-      }
+      speakWithGap(s.placed, s.total);
       // If the final design hasn't arrived and we're past 70% of massing,
       // stretch the delay so we don't finish and stand idle. Quadratic ramp
       // from BASE at 70% to MAX at 100%.
@@ -2235,6 +2331,7 @@ export class MinecraftAgent {
       const desc = isFinal
         ? `${build.description} (${build.width}×${build.height}×${build.length}, ${blocks.length} blocks)`
         : `${build.description} — ${label}`;
+      lastDescription = build.description;
       this.log(`[gemini-build] rendering ${label} — ${blocks.length} blocks${isFinal ? ' (final)' : ''}`);
       if (isFinal) finalArrived = true;
       // Cancel any in-flight render; applyTransition will diff from whatever
@@ -2258,7 +2355,7 @@ export class MinecraftAgent {
       { origin: { x: origin.x, y: origin.y, z: origin.z, rotation: rot as 0 | 90 | 180 | 270 } },
     );
     if (!generated.blocks.length) {
-      this.onAutonomousMessage?.(pickLine(lines.fail));
+      void this.speakBuildLine('fail', { prompt: message, mode: 'build' });
       return '';
     }
 
@@ -2271,24 +2368,23 @@ export class MinecraftAgent {
     }
     const status = this.builder.getStatus();
     if (status.phase === 'error') {
-      this.onAutonomousMessage?.(pickLine(lines.fail));
+      void this.speakBuildLine('fail', { prompt: message, description: lastDescription, mode: 'build', errorMessage: status.message });
       return '';
     }
     if (status.phase === 'cancelled') {
-      this.onAutonomousMessage?.(pickLine(lines.cancelled));
+      void this.speakBuildLine('cancelled', { prompt: message, description: lastDescription, mode: 'build' });
       return '';
     }
-    this.onAutonomousMessage?.(pickLine(lines.done));
+    void this.speakBuildLine('done', { prompt: message, description: lastDescription, placed: status.placed, total: status.total, mode: 'build' });
     return '';
   }
 
   private async runGeminiEdit(buildId: string, message: string): Promise<string> {
-    const lines = BUILD_VOICELINES[this.personality];
     this.log(`[gemini-edit] editing ${buildId}: "${message}"`);
 
     const generated = await editFromPrompt(buildId, message, this.log);
     if (!generated.blocks.length) {
-      this.onAutonomousMessage?.(pickLine(lines.fail));
+      void this.speakBuildLine('fail', { prompt: message, mode: 'edit' });
       return '';
     }
 
@@ -2317,22 +2413,34 @@ export class MinecraftAgent {
       };
     });
 
+    const description = generated.description;
+
+    const speakWithGap = makeBuildLineSpeaker(
+      (moment, placed, total) => void this.speakBuildLine(moment, { prompt: message, description, placed, total, mode: 'edit' }),
+    );
+
+    const onProgress = (s: BuildStatus): void => {
+      this.onBuildStatus?.(s);
+      if (s.phase !== 'building') return;
+      speakWithGap(s.placed, s.total);
+    };
+
     this.builder.cancelBuild();
     await this.builder.awaitIdle();
     this.builder.endFreshSession();
     const desc = `${generated.description} (edited: ${message.slice(0, 40)})`;
-    await this.builder.replayInto(buildId, blocks, desc, origin, (s) => this.onBuildStatus?.(s));
+    await this.builder.replayInto(buildId, blocks, desc, origin, onProgress);
 
     const status = this.builder.getStatus();
     if (status.phase === 'error') {
-      this.onAutonomousMessage?.(pickLine(lines.fail));
+      void this.speakBuildLine('fail', { prompt: message, description, mode: 'edit', errorMessage: status.message });
       return '';
     }
     if (status.phase === 'cancelled') {
-      this.onAutonomousMessage?.(pickLine(lines.cancelled));
+      void this.speakBuildLine('cancelled', { prompt: message, description, mode: 'edit' });
       return '';
     }
-    this.onAutonomousMessage?.(pickLine(lines.done));
+    void this.speakBuildLine('done', { prompt: message, description, placed: status.placed, total: status.total, mode: 'edit' });
     return '';
   }
 
@@ -3325,6 +3433,33 @@ export class MinecraftAgent {
       }
 
       // ───────── Build control ─────────
+
+      case 'start_build': {
+        const { prompt } = args as { prompt: string };
+        const senderName = this.currentSender ?? 'voice';
+        void this.runGeminiBuild(prompt, senderName).catch(err => {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.log(`[gemini-build] failed: ${msg}`);
+          void this.speakBuildLine('fail', { prompt, errorMessage: msg });
+        });
+        return `Build started in background: "${prompt}". Reply to the player now in your own voice.`;
+      }
+
+      case 'edit_build': {
+        const { prompt } = args as { prompt: string };
+        const senderName = this.currentSender ?? 'voice';
+        const playerEntity = this.bot.players[senderName]?.entity;
+        const refPos = playerEntity?.position ?? this.bot.entity?.position;
+        if (!refPos) return 'No player position available; cannot find a build to edit.';
+        const nearest = await findNearestBuild({ x: refPos.x, y: refPos.y, z: refPos.z });
+        if (!nearest) return 'No nearby build to edit. Ask them to start a new one with start_build.';
+        void this.runGeminiEdit(nearest.id, prompt).catch(err => {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.log(`[gemini-edit] failed: ${msg}`);
+          void this.speakBuildLine('fail', { prompt, errorMessage: msg });
+        });
+        return `Edit started in background: "${prompt}". Reply to the player now in your own voice.`;
+      }
 
       case 'build_demolish': {
         if (!this.builder.hasActive()) return 'Nothing to demolish';
