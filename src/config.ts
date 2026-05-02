@@ -7,7 +7,6 @@ export interface BotConfig {
   voiceEnabled: boolean;
   ownerUsername?: string;
   voicePort: number;
-  voiceAutoOpen: boolean;
   elevenLabsEnabled: boolean;
   elevenLabsApiKey?: string;
   elevenLabsVoiceId?: string;
