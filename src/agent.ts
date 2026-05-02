@@ -1150,6 +1150,8 @@ export class MinecraftAgent {
   private lastHealthWarn = 0;
   private lastDamageWarn = 0;
   private lastProximityWarn = 0;
+  private lastRecoveryTime = 0;
+  private isThinking = false;
   private notes = new Map<string, string>();
   private currentSender = '';
   private onAutonomousMessage?: (msg: string) => void;
@@ -1254,49 +1256,66 @@ export class MinecraftAgent {
     const bot = this.bot;
 
     bot.on('health', () => {
-      const now = Date.now();
-      if ((bot.food ?? 20) <= 8 && now - this.lastAutoEat > 15000) {
-        this.lastAutoEat = now;
-        this.executeTool('eat', {})
-          .then(result => {
-            if (!result.startsWith('No food')) this.onAutonomousMessage?.(result);
-          })
-          .catch(() => {});
-      }
-      if ((bot.health ?? 20) <= 4 && now - this.lastHealthWarn > 8000) {
-        this.lastHealthWarn = now;
-        this.onAutonomousMessage?.("I'm almost dead, help!");
+      try {
+        const now = Date.now();
+        if ((bot.food ?? 20) <= 8 && now - this.lastAutoEat > 15000) {
+          this.lastAutoEat = now;
+          this.executeTool('eat', {})
+            .then(result => {
+              if (!result.startsWith('No food')) this.onAutonomousMessage?.(result);
+            })
+            .catch(() => {});
+        }
+        if ((bot.health ?? 20) <= 4 && now - this.lastHealthWarn > 8000) {
+          this.lastHealthWarn = now;
+          this.onAutonomousMessage?.("I'm almost dead, help!");
+        }
+      } catch (err) {
+        this.log(`[agent] error in health listener: ${err instanceof Error ? err.message : String(err)}`);
       }
     });
 
     (bot as any).on('entityHurt', (entity: any) => {
-      if (!bot.entity || entity !== bot.entity) return;
-      const now = Date.now();
-      this.scheduleMovementRecoveryAfterDamage();
-      if (now - this.lastDamageWarn < 5000) return;
-      this.lastDamageWarn = now;
-      this.onAutonomousMessage?.('ouch! taking damage!');
+      try {
+        if (!bot.entity || entity !== bot.entity) return;
+        const now = Date.now();
+        this.scheduleMovementRecoveryAfterDamage();
+        if (now - this.lastDamageWarn < 5000) return;
+        this.lastDamageWarn = now;
+        this.onAutonomousMessage?.('ouch! taking damage!');
+      } catch (err) {
+        this.log(`[agent] error in entityHurt listener: ${err instanceof Error ? err.message : String(err)}`);
+      }
     });
 
     bot.on('physicsTick', () => {
-      if (!bot.entity) return;
-      const now = Date.now();
-      if (now - this.lastProximityWarn < 10000) return;
-      const hostile = bot.nearestEntity(e => {
-        const dist = bot.entity!.position.distanceTo(e.position);
-        return dist <= 8 && HOSTILE_MOBS.has(e.name?.toLowerCase() ?? '');
-      });
-      if (hostile) {
-        this.lastProximityWarn = now;
-        const dist = bot.entity.position.distanceTo(hostile.position).toFixed(0);
-        this.onAutonomousMessage?.(`${hostile.name} ${dist}m away!`);
+      try {
+        if (!bot.entity) return;
+        const now = Date.now();
+        if (now - this.lastProximityWarn < 10000) return;
+        const hostile = bot.nearestEntity(e => {
+          if (!bot.entity) return false;
+          const dist = bot.entity.position.distanceTo(e.position);
+          return dist <= 8 && HOSTILE_MOBS.has(e.name?.toLowerCase() ?? '');
+        });
+        if (hostile && bot.entity) {
+          this.lastProximityWarn = now;
+          const dist = bot.entity.position.distanceTo(hostile.position).toFixed(0);
+          this.onAutonomousMessage?.(`${hostile.name} ${dist}m away!`);
+        }
+      } catch (err) {
+        this.log(`[agent] error in proximity physicsTick listener: ${err instanceof Error ? err.message : String(err)}`);
       }
     });
   }
 
   private scheduleMovementRecoveryAfterDamage(): void {
-    setTimeout(() => this.recoverMovementAfterDamage(), 350);
-    setTimeout(() => this.recoverMovementAfterDamage(), 1200);
+    const now = Date.now();
+    if (now - this.lastRecoveryTime < 2000) return;
+    this.lastRecoveryTime = now;
+    this.log('[agent] scheduling movement recovery after damage');
+    setTimeout(() => this.recoverMovementAfterDamage(), 400);
+    setTimeout(() => this.recoverMovementAfterDamage(), 1500);
   }
 
   private recoverMovementAfterDamage(): void {
@@ -1317,8 +1336,9 @@ export class MinecraftAgent {
     if (!this.activeNavigationGoal) return;
     const goal = this.activeNavigationGoal;
     const distance = bot.entity.position.distanceTo(this.makeVec3(goal.x, goal.y, goal.z));
-    if (distance <= goal.range + 0.75) return;
+    if (distance <= goal.range + 0.5) return;
 
+    this.log(`[agent] recovering navigation to (${goal.x.toFixed(0)}, ${goal.y.toFixed(0)}, ${goal.z.toFixed(0)})`);
     bot.pathfinder.setMovements(this.getMovements());
     bot.pathfinder.setGoal(new goals.GoalNear(goal.x, goal.y, goal.z, goal.range));
   }
@@ -1362,135 +1382,148 @@ export class MinecraftAgent {
   }
 
   async handleMessage(message: string, sender: string): Promise<string> {
-    this.currentSender = sender;
-    const fast = this.tryFastPath(message, sender);
-    if (fast !== null) return fast;
+    if (this.isThinking) {
+      const p = this.personality;
+      if (p === 'tsundere') return "H-hey! I'm busy! Wait your turn!";
+      if (p === 'arrogant') return "Silence. I am currently occupied with a task.";
+      if (p === 'flirty') return "Hold on cutie, I'm already focused on something else~";
+      return "I'm already thinking about something! Give me a moment.";
+    }
 
-    if (looksLikeBuildIntent(message)) {
+    this.isThinking = true;
+    try {
       this.currentSender = sender;
-      const lines = BUILD_VOICELINES[this.personality];
-      void this.runGeminiBuild(message, sender).catch(err => {
-        const msg = err instanceof Error ? err.message : String(err);
-        this.log(`[gemini-build] failed: ${msg}`);
-        this.onAutonomousMessage?.(pickLine(lines.fail));
-      });
-      return pickLine(lines.ack);
-    }
+      const fast = this.tryFastPath(message, sender);
+      if (fast !== null) return fast;
 
-    const bot = this.bot;
-    const pos = bot.entity?.position;
-
-    const invItems = bot.inventory.items();
-    const invSummary = invItems.length
-      ? invItems.map(i => `${i.name}x${i.count}`).join(', ')
-      : 'empty';
-    const slotsUsed = invItems.length;
-
-    const timeOfDay = bot.time?.timeOfDay ?? 0;
-    const timeLabel = timeOfDay < 13000 ? 'day' : 'night';
-
-    const xpLevel = (bot as any).experience?.level ?? 0;
-    if (sender && sender !== 'voice' && !this.memory.owner) {
-      this.memory.owner = sender;
-      this.saveMemory();
-    }
-
-    const armorItems = [5, 6, 7, 8]
-      .map(i => (bot.inventory.slots as any[])[i])
-      .filter(Boolean)
-      .map((item: any) => item.name as string);
-    const armorSummary = armorItems.length ? armorItems.join(', ') : 'none';
-
-    const nearbyHostiles = pos
-      ? Object.values(bot.entities).filter(e => {
-          const dist = pos.distanceTo(e.position);
-          return dist <= 24 && HOSTILE_MOBS.has(e.name?.toLowerCase() ?? '');
-        })
-      : [];
-    const hostileSummary = nearbyHostiles.length
-      ? nearbyHostiles.slice(0, 5)
-          .map(e => `${e.name}(${pos!.distanceTo(e.position).toFixed(0)}m)`)
-          .join(', ')
-      : 'none';
-
-    const state = pos
-      ? [
-          `Pos: (${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})`,
-          `Health: ${(bot.health ?? 0).toFixed(0)}/20`,
-          `Food: ${bot.food ?? 0}/20`,
-          `XP: lvl ${xpLevel}`,
-          `Time: ${timeLabel}`,
-          `Defend: ${this.defendActive ? 'ON' : 'OFF'}`,
-          `Home: ${this.homePosition ? `(${this.homePosition.x.toFixed(0)}, ${this.homePosition.y.toFixed(0)}, ${this.homePosition.z.toFixed(0)})` : 'not set'}`,
-          `Task: ${this.memory.activeTask ? `${this.memory.activeTask.goal} (${this.memory.activeTask.progress.length}/${this.memory.activeTask.plan.length})` : 'none'}`,
-          `Memory: chests ${this.memory.knownChests.length}, resources ${this.memory.knownResources.length}, avoid ${this.memory.avoidAreas.length}`,
-          `Armor: ${armorSummary}`,
-          `Inv: ${slotsUsed}/36 — ${invSummary}`,
-          `Nearby hostiles: ${hostileSummary}`,
-        ].join(' | ')
-      : 'Not yet spawned';
-
-    if (this.provider === 'gemini') {
-      return this.handleGeminiMessage(message, sender, state);
-    }
-
-    if (!this.openai) throw new Error('OpenAI client is not configured');
-
-    const messages: ChatCompletionMessageParam[] = [
-      { role: 'system', content: `${buildSystemPrompt(this.personality)}\n\nCurrent state: ${state}` },
-      ...this.history,
-      { role: 'user', content: `${sender} says: "${message}"` },
-    ];
-
-    this.currentSender = sender;
-    let iterations = 0;
-    while (iterations++ < 16) {
-      const response = await this.openai.chat.completions.create({
-        model: this.openaiModel,
-        messages,
-        tools: TOOLS,
-        tool_choice: 'auto',
-        parallel_tool_calls: false,
-        max_tokens: 1024,
-      });
-
-      const choice = response.choices[0];
-      messages.push(choice.message);
-
-      if (!choice.message.tool_calls?.length) {
-        const exchange = messages.slice(1);
-        const raw = [...this.history, ...exchange].slice(-this.HISTORY_LIMIT);
-        const firstUser = raw.findIndex(m => m.role === 'user');
-        this.history = firstUser >= 0 ? raw.slice(firstUser) : [];
-        return choice.message.content ?? '';
+      if (looksLikeBuildIntent(message)) {
+        this.currentSender = sender;
+        const lines = BUILD_VOICELINES[this.personality];
+        void this.runGeminiBuild(message, sender).catch(err => {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.log(`[gemini-build] failed: ${msg}`);
+          this.onAutonomousMessage?.(pickLine(lines.fail));
+        });
+        return pickLine(lines.ack);
       }
 
-      const toolResults = await Promise.all(
-        choice.message.tool_calls.map(async (toolCall) => {
-          if (toolCall.type !== 'function') return null;
-          const fn = (toolCall as { id: string; type: 'function'; function: { name: string; arguments: string } }).function;
-          let result: string;
-          try {
-            const args = JSON.parse(fn.arguments) as Record<string, unknown>;
-            result = await this.executeTool(fn.name, args);
-            this.log(`[agent] ${fn.name}(${fn.arguments}) → ${result}`);
-          } catch (err) {
-            result = `Error: ${err instanceof Error ? err.message : String(err)}`;
-            this.log(`[agent] ${fn.name} failed: ${result}`);
-          }
-          return { tool_call_id: toolCall.id, content: result };
-        })
-      );
+      const bot = this.bot;
+      const pos = bot.entity?.position;
 
-      for (const r of toolResults) {
-        if (r) messages.push({ role: 'tool', tool_call_id: r.tool_call_id, content: r.content });
+      const invItems = bot.inventory.items();
+      const invSummary = invItems.length
+        ? invItems.map(i => `${i.name}x${i.count}`).join(', ')
+        : 'empty';
+      const slotsUsed = invItems.length;
+
+      const timeOfDay = bot.time?.timeOfDay ?? 0;
+      const timeLabel = timeOfDay < 13000 ? 'day' : 'night';
+
+      const xpLevel = (bot as any).experience?.level ?? 0;
+      if (sender && sender !== 'voice' && !this.memory.owner) {
+        this.memory.owner = sender;
+        this.saveMemory();
       }
-    }
 
-    const raw = messages.slice(1).slice(-this.HISTORY_LIMIT);
-    const firstUser = raw.findIndex(m => m.role === 'user');
-    this.history = firstUser >= 0 ? raw.slice(firstUser) : [];
-    return "I got confused. Try again?";
+      const armorItems = [5, 6, 7, 8]
+        .map(i => (bot.inventory.slots as any[])[i])
+        .filter(Boolean)
+        .map((item: any) => item.name as string);
+      const armorSummary = armorItems.length ? armorItems.join(', ') : 'none';
+
+      const nearbyHostiles = pos
+        ? Object.values(bot.entities).filter(e => {
+            const dist = pos.distanceTo(e.position);
+            return dist <= 24 && HOSTILE_MOBS.has(e.name?.toLowerCase() ?? '');
+          })
+        : [];
+      const hostileSummary = nearbyHostiles.length
+        ? nearbyHostiles.slice(0, 5)
+            .map(e => `${e.name}(${pos!.distanceTo(e.position).toFixed(0)}m)`)
+            .join(', ')
+        : 'none';
+
+      const state = pos
+        ? [
+            `Pos: (${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})`,
+            `Health: ${(bot.health ?? 0).toFixed(0)}/20`,
+            `Food: ${bot.food ?? 0}/20`,
+            `XP: lvl ${xpLevel}`,
+            `Time: ${timeLabel}`,
+            `Defend: ${this.defendActive ? 'ON' : 'OFF'}`,
+            `Home: ${this.homePosition ? `(${this.homePosition.x.toFixed(0)}, ${this.homePosition.y.toFixed(0)}, ${this.homePosition.z.toFixed(0)})` : 'not set'}`,
+            `Task: ${this.memory.activeTask ? `${this.memory.activeTask.goal} (${this.memory.activeTask.progress.length}/${this.memory.activeTask.plan.length})` : 'none'}`,
+            `Memory: chests ${this.memory.knownChests.length}, resources ${this.memory.knownResources.length}, avoid ${this.memory.avoidAreas.length}`,
+            `Armor: ${armorSummary}`,
+            `Inv: ${slotsUsed}/36 — ${invSummary}`,
+            `Nearby hostiles: ${hostileSummary}`,
+          ].join(' | ')
+        : 'Not yet spawned';
+
+      if (this.provider === 'gemini') {
+        return await this.handleGeminiMessage(message, sender, state);
+      }
+
+      if (!this.openai) throw new Error('OpenAI client is not configured');
+
+      const messages: ChatCompletionMessageParam[] = [
+        { role: 'system', content: `${buildSystemPrompt(this.personality)}\n\nCurrent state: ${state}` },
+        ...this.history,
+        { role: 'user', content: `${sender} says: "${message}"` },
+      ];
+
+      this.currentSender = sender;
+      let iterations = 0;
+      while (iterations++ < 16) {
+        const response = await this.openai.chat.completions.create({
+          model: this.openaiModel,
+          messages,
+          tools: TOOLS,
+          tool_choice: 'auto',
+          parallel_tool_calls: false,
+          max_tokens: 1024,
+        });
+
+        const choice = response.choices[0];
+        messages.push(choice.message);
+
+        if (!choice.message.tool_calls?.length) {
+          const exchange = messages.slice(1);
+          const raw = [...this.history, ...exchange].slice(-this.HISTORY_LIMIT);
+          const firstUser = raw.findIndex(m => m.role === 'user');
+          this.history = firstUser >= 0 ? raw.slice(firstUser) : [];
+          return choice.message.content ?? '';
+        }
+
+        const toolResults = await Promise.all(
+          choice.message.tool_calls.map(async (toolCall) => {
+            if (toolCall.type !== 'function') return null;
+            const fn = (toolCall as { id: string; type: 'function'; function: { name: string; arguments: string } }).function;
+            let result: string;
+            try {
+              const args = JSON.parse(fn.arguments) as Record<string, unknown>;
+              result = await this.executeTool(fn.name, args);
+              this.log(`[agent] ${fn.name}(${fn.arguments}) → ${result}`);
+            } catch (err) {
+              result = `Error: ${err instanceof Error ? err.message : String(err)}`;
+              this.log(`[agent] ${fn.name} failed: ${result}`);
+            }
+            return { tool_call_id: toolCall.id, content: result };
+          })
+        );
+
+        for (const r of toolResults) {
+          if (r) messages.push({ role: 'tool', tool_call_id: r.tool_call_id, content: r.content });
+        }
+      }
+
+      const raw = messages.slice(1).slice(-this.HISTORY_LIMIT);
+      const firstUser = raw.findIndex(m => m.role === 'user');
+      this.history = firstUser >= 0 ? raw.slice(firstUser) : [];
+      return "I got confused. Try again?";
+    } finally {
+      this.isThinking = false;
+    }
   }
 
   private async handleGeminiMessage(message: string, sender: string, state: string): Promise<string> {
@@ -2202,20 +2235,34 @@ export class MinecraftAgent {
       this.activeNavigationGoal = { id: navId, x, y, z, range };
       bot.pathfinder.setMovements(this.getMovements());
 
-      const timeoutId = setTimeout(() => {
+      const cleanup = () => {
+        clearTimeout(timeoutId);
         bot.removeListener('goal_reached', onReached);
+        bot.removeListener('path_update', onPathUpdate);
         if (this.activeNavigationGoal?.id === navId) this.activeNavigationGoal = null;
+      };
+
+      const timeoutId = setTimeout(() => {
+        cleanup();
         bot.pathfinder.stop();
         reject(new Error('Navigation timed out'));
       }, timeoutMs);
 
       const onReached = () => {
-        clearTimeout(timeoutId);
-        if (this.activeNavigationGoal?.id === navId) this.activeNavigationGoal = null;
+        cleanup();
         resolve();
       };
 
+      const onPathUpdate = (results: any) => {
+        if (results.status === 'noPath') {
+          cleanup();
+          bot.pathfinder.stop();
+          reject(new Error('No path possible to destination'));
+        }
+      };
+
       bot.once('goal_reached', onReached);
+      bot.on('path_update', onPathUpdate);
       bot.pathfinder.setGoal(new goals.GoalNear(x, y, z, range));
     });
   }
@@ -2751,6 +2798,12 @@ export class MinecraftAgent {
 
           let lastAttack = 0;
           const onTick = async () => {
+            if (!bot.entity) {
+              clearTimeout(timeout);
+              bot.off('physicsTick', onTick);
+              resolve('Combat aborted — I died');
+              return;
+            }
             const e = bot.entities[targetId];
             if (!e) {
               clearTimeout(timeout);
@@ -2761,7 +2814,7 @@ export class MinecraftAgent {
             const now = Date.now();
             if (now - lastAttack < 600) return;
             lastAttack = now;
-            const d = bot.entity!.position.distanceTo(e.position);
+            const d = bot.entity.position.distanceTo(e.position);
             if (d > 3) {
               bot.pathfinder.setGoal(new goals.GoalNear(e.position.x, e.position.y, e.position.z, 2));
               return;
