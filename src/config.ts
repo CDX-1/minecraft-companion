@@ -1,9 +1,13 @@
 export type Personality = 'friendly' | 'flirty' | 'tsundere' | 'arrogant';
+export type AutonomyLevel = 'passive' | 'balanced' | 'proactive';
 
 export interface BotConfig {
   host: string;
   port: number;
   username: string;
+  companionName?: string;
+  companionBio?: string;
+  autonomyLevel: AutonomyLevel;
   personality: Personality;
   ignoredUsernames: string[];
   auth: 'offline' | 'microsoft';

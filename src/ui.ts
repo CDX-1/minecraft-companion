@@ -35,10 +35,11 @@ export function launchUI(config: BotConfig): void {
     height: 3,
     tags: true,
     content:
-      ` {bold}MC COMPANION{/bold}  {gray-fg}target{/gray-fg} ${config.host}:${config.port}` +
+      ` {bold}${config.companionName ? config.companionName.toUpperCase() : 'MC COMPANION'}{/bold}` +
+      `  {gray-fg}target{/gray-fg} ${config.host}:${config.port}` +
       `  {gray-fg}callsign{/gray-fg} ${config.username}` +
       `  {yellow-fg}connecting{/yellow-fg}\n` +
-      ' {gray-fg}chat monitor · voice bridge · pathfinder · agent console{/gray-fg}',
+      ` {gray-fg}${config.personality} · ${config.autonomyLevel} autonomy · chat monitor · pathfinder · agent{/gray-fg}`,
     style: { bg: 'black', fg: 'white', bold: true },
   });
 
@@ -478,10 +479,11 @@ export function launchUI(config: BotConfig): void {
 
     bot.once('spawn', () => {
       statusBar.setContent(
-        ` {bold}MC COMPANION{/bold}  {gray-fg}target{/gray-fg} ${config.host}:${config.port}` +
+        ` {bold}${config.companionName ? config.companionName.toUpperCase() : 'MC COMPANION'}{/bold}` +
+        `  {gray-fg}target{/gray-fg} ${config.host}:${config.port}` +
         `  {gray-fg}callsign{/gray-fg} ${bot.username}` +
         `  {green-fg}online{/green-fg}\n` +
-        ' {gray-fg}chat monitor · voice bridge · pathfinder · agent console{/gray-fg}'
+        ` {gray-fg}${config.personality} · ${config.autonomyLevel} autonomy · chat monitor · pathfinder · agent{/gray-fg}`
       );
       statusBar.style.bg = 'green';
       logSystem(`Spawned as ${bot.username}.`);
@@ -498,6 +500,9 @@ export function launchUI(config: BotConfig): void {
             provider: 'openai',
             apiKey: openaiApiKey,
             personality: config.personality,
+            companionName: config.companionName,
+            companionBio: config.companionBio,
+            autonomyLevel: config.autonomyLevel,
             buildCrew: {
               enabled: config.buildCrewEnabled,
               host: config.host,

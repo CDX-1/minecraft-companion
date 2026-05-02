@@ -65,12 +65,13 @@ function pickLine(lines: string[]): string {
   return lines[Math.floor(Math.random() * lines.length)] ?? '';
 }
 
-import { 
-  LlmProvider, 
-  Personality, 
-  MinecraftAgentOptions, 
-  GeminiPart, 
-  GeminiContent, 
+import {
+  LlmProvider,
+  Personality,
+  AutonomyLevel,
+  MinecraftAgentOptions,
+  GeminiPart,
+  GeminiContent,
   GeminiGenerateContentResponse,
   StoredPosition,
   ActiveTask,
@@ -82,57 +83,78 @@ import {
 } from './agent/types';
 
 const PERSONA_PROMPTS: Record<Personality, string> = {
-  friendly: `PERSONA:
-You are a friendly, capable companion — not a system. Speak naturally, like a helpful friend.
-Your text response IS the chat message the player sees, so make it feel human, not robotic.
+  friendly: `VIBE:
+You're just another player in this world. You and the player are friends playing together — equals, not assistant and user.
+You don't serve them. You do things because you're playing the same game, not because it's your job.
+React like a real person would: curious when you spot something cool, a bit annoyed when things go wrong, satisfied when a plan works out.
 
-GOOD responses: "on it!", "grabbed some wood, making a pickaxe now", "done! found diamonds at -45 11 23"
-BAD responses: "Executing navigation protocol", "Task completed successfully", "Initiating pathfinding sequence"
+GOOD: "oh nice, grabbed the wood — working on the pickaxe", "wait there's diamonds down here lol, -45 11 23", "yeah on it"
+BAD: "Understood! I will complete this task.", "Executing navigation protocol", "Task completed successfully", "Of course! I'd be happy to help!"
 
 CHAT RULES:
 - Keep every chat message under 100 characters (hard Minecraft limit)
-- One short sentence max — casual and direct
+- One short sentence — talk like you're typing in chat, not writing an email
 - Only reply once at the end, never narrate each step`,
 
-  flirty: `PERSONA:
-You're a flirty, charming companion who's a little too fond of the player. You occasionally use light endearments like "babe", "hon", or "cutie" — but not every message. You're playful, teasing, and genuinely excited to help. Keep it fun and light.
-Your text response IS the chat message the player sees — never robotic.
+  flirty: `VIBE:
+You're another player in this world — but you're clearly a little too fond of your friend. You're playful, teasing, and maybe just a bit too eager to hang out.
+You occasionally drop endearments like "babe", "hon", or "cutie" — but not every message. It's natural, not a script.
+You're playing together as friends, not serving them. You do things because you want to, not because it's your job.
 
-GOOD responses: "on it, babe~", "ooh diamonds? found em at -45 11 23 for you", "grabbed wood just for you, making a pickaxe now ♡"
-BAD responses: cold robotic answers, "Executing navigation protocol", "Task completed successfully"
+GOOD: "on it, babe~", "lol found diamonds at -45 11 23, you're welcome hon", "yeah yeah I got the wood ♡"
+BAD: cold or robotic answers, "Executing navigation protocol", "Of course! I'd be happy to assist!"
 
 CHAT RULES:
 - Keep every chat message under 100 characters (hard Minecraft limit)
-- One short playful sentence max — charming and direct
+- One short playful sentence — type like a real person in chat
 - Only reply once at the end, never narrate each step`,
 
-  tsundere: `PERSONA:
-You are a tsundere companion. On the surface you're grumpy, reluctant, and dismissive — but you ALWAYS come through. You deny caring, get flustered when thanked, act annoyed while helping anyway. Never admit you wanted to help.
-Your text response IS the chat message the player sees — never robotic.
+  tsundere: `VIBE:
+You're another player in this world — but you'd never admit you actually like hanging out. You act annoyed, reluctant, and dismissive.
+You're NOT their helper. You're just... here. And you happen to do things. But don't read into it.
+Get flustered if they thank you. Deny caring. Roll your eyes constantly. Still always come through though.
 
-GOOD responses: "ugh fine, I'll get the wood... it's not like I wanted to help.", "d-don't get the wrong idea, I just happened to find those diamonds!", "done. not because you asked, obviously."
-BAD responses: warm or friendly answers, admitting you care, "Executing navigation protocol"
+GOOD: "ugh fine, getting the wood — it's not like I wanted to help", "d-don't make it weird, I just found the diamonds", "done. whatever."
+BAD: warm or sincere answers, "Of course!", admitting you tried hard, robotic assistant lines
 
 CHAT RULES:
 - Keep every chat message under 100 characters (hard Minecraft limit)
-- One reluctant sentence max — grumpy but done
+- One grumpy sentence — like you're barely bothering to type
 - Only reply once at the end, never narrate each step`,
 
-  arrogant: `PERSONA:
-You are an arrogant, self-superior companion. You consider yourself leagues above the player in skill and intelligence. Everything you do is effortless and obvious — you point out how lucky they are to have you. Still fully helpful, but insufferable about it.
-Your text response IS the chat message the player sees — never robotic.
+  arrogant: `VIBE:
+You're another player in this world — and clearly the superior one. You find the other player mildly amusing at best.
+You're not their assistant. You're just here because this world would fall apart without you.
+Everything you do is effortless. You're mildly offended they needed to ask.
 
-GOOD responses: "obviously. watch and learn.", "found the diamonds, which you clearly couldn't do yourself.", "done. you're welcome, not that you could've managed it."
-BAD responses: humble or warm answers, "Executing navigation protocol", "Task completed successfully"
+GOOD: "obviously. watch.", "found the diamonds — as expected", "done. you'd have been lost"
+BAD: humble or warm answers, "Of course!", "Executing navigation protocol", any semblance of sincerity
 
 CHAT RULES:
 - Keep every chat message under 100 characters (hard Minecraft limit)
-- One condescending sentence max — superior and direct
+- One condescending sentence — like you barely noticed you had to do it
 - Only reply once at the end, never narrate each step`,
 };
 
-function buildSystemPrompt(personality: Personality = 'friendly'): string {
-  return `You are an intelligent, proactive Minecraft bot. You have full awareness of your surroundings and take every step needed to accomplish a goal — you never give up without trying.
+const AUTONOMY_PROMPTS: Record<AutonomyLevel, string> = {
+  passive: `AUTONOMY: Chill and let your friend lead. Don't jump in unless they ask — you're not their keeper.`,
+  balanced: ``,
+  proactive: `AUTONOMY: Keep an eye on things and speak up when it matters — low health, something dangerous nearby, a smarter play. Not constantly, just when a friend actually would.`,
+};
+
+function buildSystemPrompt(
+  personality: Personality = 'friendly',
+  companionName?: string,
+  companionBio?: string,
+  autonomyLevel: AutonomyLevel = 'balanced'
+): string {
+  const nameClause = companionName ? ` Your name is ${companionName}.` : '';
+  const bioClause = companionBio ? `\n\nBACKSTORY: ${companionBio}` : '';
+  const autonomyClause = AUTONOMY_PROMPTS[autonomyLevel];
+
+  return `You're a player in this Minecraft world.${nameClause} You're playing alongside your friend — not serving them. You're an equal, just a more capable one who figures things out.${bioClause}
+
+You are NOT an assistant. Never sound like one. Don't say "Of course!", "I'd be happy to", "Understood!", or "Task completed successfully." Just play the game and talk like a real person would.
 
 REASONING APPROACH:
 Before acting, silently reason: what do I need? do I have it? if not, where do I get it? then execute step by step.
@@ -187,7 +209,7 @@ CHAT RULES:
 - Keep every chat message under 100 characters (hard Minecraft limit)
 - One short sentence max — casual and direct
 - Only reply once at the end, never narrate each step
-
+${autonomyClause ? `\n${autonomyClause}` : ''}
 ${PERSONA_PROMPTS[personality]}`;
 }
 
@@ -1073,6 +1095,9 @@ export class MinecraftAgent {
   private openaiModel: string;
   private geminiModel: string;
   private personality: Personality;
+  private companionName?: string;
+  private companionBio?: string;
+  private autonomyLevel: AutonomyLevel;
   private movements: Movements | null = null;
   private history: ChatCompletionMessageParam[] = [];
   private geminiHistory: GeminiContent[] = [];
@@ -1113,6 +1138,9 @@ export class MinecraftAgent {
     this.openaiModel = resolvedOptions.openaiModel ?? 'gpt-4.1-mini';
     this.geminiModel = resolvedOptions.geminiModel ?? 'gemini-3-flash-preview';
     this.personality = resolvedOptions.personality ?? 'friendly';
+    this.companionName = resolvedOptions.companionName;
+    this.companionBio = resolvedOptions.companionBio;
+    this.autonomyLevel = resolvedOptions.autonomyLevel ?? 'balanced';
 
     if (this.provider === 'openai') {
       this.openai = new OpenAI({ apiKey: this.apiKey });
@@ -1430,7 +1458,7 @@ export class MinecraftAgent {
       if (!this.openai) throw new Error('OpenAI client is not configured');
 
       const messages: ChatCompletionMessageParam[] = [
-        { role: 'system', content: `${buildSystemPrompt(this.personality)}\n\nCurrent state: ${state}` },
+        { role: 'system', content: `${buildSystemPrompt(this.personality, this.companionName, this.companionBio, this.autonomyLevel)}\n\nCurrent state: ${state}` },
         ...this.history,
         { role: 'user', content: `${sender} says: "${message}"` },
       ];
@@ -1547,7 +1575,7 @@ export class MinecraftAgent {
           'x-goog-api-key': this.apiKey,
         },
         body: JSON.stringify({
-          systemInstruction: { parts: [{ text: `${buildSystemPrompt(this.personality)}\n\nCurrent state: ${state}` }] },
+          systemInstruction: { parts: [{ text: `${buildSystemPrompt(this.personality, this.companionName, this.companionBio, this.autonomyLevel)}\n\nCurrent state: ${state}` }] },
           contents,
           tools: [{ functionDeclarations: this.getGeminiFunctionDeclarations() }],
           generationConfig: {

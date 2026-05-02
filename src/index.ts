@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import inquirer from 'inquirer';
 import { parseIgnoredUsernames } from './chatFilter';
-import { BotConfig } from './config';
+import { AutonomyLevel, BotConfig } from './config';
 import { readOwnerUsernameFromMemory } from './ownerConfig';
 import { launchUI } from './ui';
 
@@ -68,6 +68,31 @@ async function main() {
         { name: 'Arrogant  — condescending, superior, insufferably capable', value: 'arrogant' },
       ],
       default: process.env.MC_PERSONALITY ?? 'friendly',
+    },
+    {
+      type: 'input',
+      name: 'companionName',
+      message: 'Companion name (leave blank to use username):',
+      default: process.env.MC_COMPANION_NAME ?? '',
+      filter: (value: string) => value.trim() || undefined,
+    },
+    {
+      type: 'input',
+      name: 'companionBio',
+      message: 'Companion backstory / bio (optional, press enter to skip):',
+      default: process.env.MC_COMPANION_BIO ?? '',
+      filter: (value: string) => value.trim() || undefined,
+    },
+    {
+      type: 'list',
+      name: 'autonomyLevel',
+      message: 'Companion autonomy:',
+      choices: [
+        { name: 'Passive   — only acts when directly asked', value: 'passive' },
+        { name: 'Balanced  — default behaviour (recommended)', value: 'balanced' },
+        { name: 'Proactive — monitors danger, hunger, and inventory on its own', value: 'proactive' },
+      ],
+      default: (process.env.MC_AUTONOMY_LEVEL as AutonomyLevel | undefined) ?? 'balanced',
     },
     {
       type: 'input',

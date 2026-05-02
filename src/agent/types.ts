@@ -1,5 +1,6 @@
 export type LlmProvider = 'openai' | 'gemini';
 export type Personality = 'friendly' | 'flirty' | 'tsundere' | 'arrogant';
+export type AutonomyLevel = 'passive' | 'balanced' | 'proactive';
 
 export interface MinecraftAgentOptions {
   provider: LlmProvider;
@@ -7,6 +8,9 @@ export interface MinecraftAgentOptions {
   openaiModel?: string;
   geminiModel?: string;
   personality?: Personality;
+  companionName?: string;
+  companionBio?: string;
+  autonomyLevel?: AutonomyLevel;
   ownerUsername?: string;
   buildCrew?: {
     enabled: boolean;
