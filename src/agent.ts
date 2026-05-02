@@ -1157,6 +1157,10 @@ export class MinecraftAgent {
     return this.builder.getStatus();
   }
 
+  setPersonality(personality: Personality): void {
+    this.personality = personality;
+  }
+
   private emitBuildStatus(): void {
     this.onBuildStatus?.(this.builder.getStatus());
   }
@@ -1334,6 +1338,7 @@ export class MinecraftAgent {
     }
 
     this.isThinking = true;
+    this.log(`[personality] active: ${this.personality}`);
     try {
       this.currentSender = sender;
       if (looksLikeEditIntent(message)) {

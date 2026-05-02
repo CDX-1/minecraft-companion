@@ -5,6 +5,9 @@ import { shouldIgnoreChatSender } from './chatFilter';
 import { parseChatCommand } from './commands';
 import { BotConfig } from './config';
 import { MinecraftAgent } from './agent';
+import type { Personality } from './agent/types';
+
+const PERSONALITIES: Personality[] = ['friendly', 'flirty', 'tsundere', 'arrogant'];
 import { classifyDamageMoodDelta, createMoodTracker, type MoodTracker } from './botMood';
 import { GlobalPushToTalk, startGlobalPushToTalk } from './globalPushToTalk';
 import { createLedStatusController, LedStatusController } from './ledStatus';
@@ -553,6 +556,20 @@ export function launchUI(config: BotConfig): void {
         } else if (command === 'follow') {
           followPlayer(username);
         }
+        return;
+      }
+
+      const trimmed = message.trim().toLowerCase() as Personality;
+      const isOwner = config.ownerUsername
+        ? username.trim().toLowerCase() === config.ownerUsername.trim().toLowerCase()
+        : true;
+      chatLog.log(`{gray-fg}[personality-dbg] sender=${username} isOwner=${isOwner} msg="${trimmed}" valid=${PERSONALITIES.includes(trimmed)}{/gray-fg}`);
+      screen.render();
+      if (isOwner && PERSONALITIES.includes(trimmed)) {
+        agent.setPersonality(trimmed);
+        chatLog.log(`{green-fg}[personality]{/green-fg} switched to ${trimmed}`);
+        screen.render();
+        botSay(`switched to ${trimmed} mode`);
         return;
       }
 
