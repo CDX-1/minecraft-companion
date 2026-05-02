@@ -55,6 +55,12 @@ export function assignCrewWork(ops: BuildOperation[], crewSize: number): BuildOp
   return assignments.filter(group => group.length > 0);
 }
 
+export function separateOpsPhases(ops: BuildOperation[]): { clears: BuildOperation[]; places: BuildOperation[] } {
+  const clears = ops.filter(op => op.block === 'minecraft:air' || op.block.includes('air'));
+  const places = ops.filter(op => !op.block.includes('air'));
+  return { clears, places };
+}
+
 export class BuilderCrewSession {
   private cancelled = false;
   private helpers: Bot[] = [];
@@ -74,9 +80,14 @@ export class BuilderCrewSession {
   ): Promise<void> {
     this.cancelled = false;
     const createBot = this.opts.createBot ?? mineflayer.createBot;
-    const assignments = assignCrewWork(ops, this.opts.crewSize);
     
-    const usernames = assignments.map((_, index) => makeCrewUsername(this.opts.mainUsername, index));
+    // Separate into two phases: clears first, then places
+    const { clears, places } = separateOpsPhases(ops);
+    const allPhases = [clears, places].filter(phase => phase.length > 0);
+    
+    const usernames = Array.from({ length: this.opts.crewSize }, (_, index) => 
+      makeCrewUsername(this.opts.mainUsername, index)
+    );
     this.helpers = usernames.map(username => createBot({
       host: this.opts.host,
       port: this.opts.port,
@@ -87,25 +98,37 @@ export class BuilderCrewSession {
 
     try {
       await Promise.all(this.helpers.map((bot, index) => this.waitForSpawn(bot, usernames[index])));
-      let placed = 0;
+      let totalProcessed = 0;
       this.opts.log?.(`[build-crew] helpers online: ${this.helpers.map(bot => bot.username).join(', ')}`);
       if (origin) await this.splitFromOrigin(origin);
-      onProgress({ total: ops.length, placed, helpers: this.helpers.map(bot => bot.username) });
+      onProgress({ total: ops.length, placed: 0, helpers: this.helpers.map(bot => bot.username) });
 
-      await Promise.all(assignments.map(async (group, index) => {
-        const bot = this.helpers[index];
-        if (!bot) return;
-        this.command(`/gamemode creative ${bot.username}`);
-        await wait(50);
-        for (const op of group) {
-          if (this.cancelled) return;
-          this.command(`/tp ${bot.username} ${formatCoord(op.x)} ${formatCoord(op.y + 3)} ${formatCoord(op.z)}`);
-          this.command(`/setblock ${op.x} ${op.y} ${op.z} ${op.block}`);
-          placed += 1;
-          onProgress({ total: ops.length, placed, helpers: this.helpers.map(helper => helper.username) });
-          await wait(this.opts.frameDelayMs ?? 35);
-        }
-      }));
+      // Execute each phase sequentially to maintain order invariant
+      for (const phase of allPhases) {
+        const assignments = assignCrewWork(phase, this.opts.crewSize);
+        let phaseProcessed = 0;
+
+        await Promise.all(assignments.map(async (group, index) => {
+          const bot = this.helpers[index];
+          if (!bot) return;
+          this.command(`/gamemode creative ${bot.username}`);
+          await wait(50);
+          for (const op of group) {
+            if (this.cancelled) return;
+            this.command(`/tp ${bot.username} ${formatCoord(op.x)} ${formatCoord(op.y + 3)} ${formatCoord(op.z)}`);
+            this.command(`/setblock ${op.x} ${op.y} ${op.z} ${op.block}`);
+            phaseProcessed += 1;
+            onProgress({ 
+              total: ops.length, 
+              placed: totalProcessed + phaseProcessed, 
+              helpers: this.helpers.map(helper => helper.username) 
+            });
+            await wait(this.opts.frameDelayMs ?? 35);
+          }
+        }));
+
+        totalProcessed += phaseProcessed;
+      }
     } finally {
       if (origin) await this.mergeToOrigin(origin);
       for (const bot of this.helpers) bot.quit();
