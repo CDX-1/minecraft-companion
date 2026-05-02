@@ -26,7 +26,8 @@
     "inquirer": "^8.2.7",
     "mineflayer": "^4.37.0",
     "mineflayer-pathfinder": "^2.4.5",
-    "openai": "^6.35.0"
+    "openai": "^6.35.0",
+    "speaker": "^0.5.4"
   },
   "devDependencies": {
     "@types/blessed": "^0.1.27",

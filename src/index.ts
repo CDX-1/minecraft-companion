@@ -15,6 +15,10 @@ async function main() {
   const envElevenLabsModelId = process.env.ELEVENLABS_MODEL_ID?.trim() || 'eleven_turbo_v2_5';
   const envElevenLabsStability = Number(process.env.ELEVENLABS_STABILITY) || 0.4;
   const envElevenLabsSimilarityBoost = Number(process.env.ELEVENLABS_SIMILARITY_BOOST) || 0.75;
+  const envElevenLabsStreaming = process.env.ELEVENLABS_STREAMING
+    ? process.env.ELEVENLABS_STREAMING === 'true'
+    : true;
+  const envElevenLabsLatency = Math.max(0, Math.min(4, Number(process.env.ELEVENLABS_LATENCY) || 4));
 
   const answers = await inquirer.prompt([
     {
@@ -123,6 +127,8 @@ async function main() {
     elevenLabsModelId: envElevenLabsModelId ?? answers.elevenLabsModelId,
     elevenLabsStability: envElevenLabsStability ?? answers.elevenLabsStability,
     elevenLabsSimilarityBoost: envElevenLabsSimilarityBoost ?? answers.elevenLabsSimilarityBoost,
+    elevenLabsStreaming: envElevenLabsStreaming,
+    elevenLabsLatency: envElevenLabsLatency,
   };
 
   launchUI(config);
