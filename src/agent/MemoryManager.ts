@@ -20,6 +20,7 @@ export class MemoryManager {
       knownResources: [],
       avoidAreas: [],
       notes: {},
+      lessons: [],
     };
   }
 
@@ -39,6 +40,7 @@ export class MemoryManager {
         knownResources: Array.isArray(raw.knownResources) ? raw.knownResources : [],
         avoidAreas: Array.isArray(raw.avoidAreas) ? raw.avoidAreas : [],
         notes: raw.notes && typeof raw.notes === 'object' ? raw.notes : {},
+        lessons: Array.isArray(raw.lessons) ? raw.lessons : [],
       };
       if (this.memory.home) {
         this.homePosition = { x: this.memory.home.x, y: this.memory.home.y, z: this.memory.home.z };
@@ -71,4 +73,40 @@ export class MemoryManager {
   public getAllNotes(): Record<string, string> {
     return Object.fromEntries(this.notes.entries());
   }
+
+  public addLesson(topic: string, content: string): void {
+    this.memory.lessons.push({
+      topic,
+      content,
+      createdAt: new Date().toISOString(),
+    });
+    this.memory.lessons = this.memory.lessons.slice(-50);
+    this.saveMemory();
+  }
+
+  public getRelevantLessons(query: string, limit = 3): string[] {
+    const queryTokens = tokenize(query);
+    return this.memory.lessons
+      .map(lesson => ({
+        lesson,
+        score: scoreLesson(queryTokens, lesson.topic, lesson.content),
+      }))
+      .filter(entry => entry.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit)
+      .map(entry => entry.lesson.content);
+  }
+}
+
+function tokenize(value: string): Set<string> {
+  return new Set(value.toLowerCase().split(/[^a-z0-9_]+/).filter(token => token.length > 2));
+}
+
+function scoreLesson(queryTokens: Set<string>, topic: string, content: string): number {
+  const lessonTokens = tokenize(`${topic} ${content}`);
+  let score = 0;
+  for (const token of queryTokens) {
+    if (lessonTokens.has(token)) score++;
+  }
+  return score;
 }

@@ -10,6 +10,14 @@ import { BuilderCrewSession } from './services/builderCrew';
 import { buildFromPrompt, editFromPrompt, findNearestBuild, listStoredBuilds, GeneratedBuild } from './services/geminiBuilder';
 import { MemoryManager } from './agent/MemoryManager';
 import { StateMachine } from './agent/StateMachine';
+import {
+  createRecipeKnowledge,
+  resolveCraftingDependencies,
+  summarizeDependencyPlan,
+  type InventoryCounts,
+  type Recipe,
+  type RecipeKnowledge,
+} from './agent/DependencyResolver';
 
 const BUILD_VOICELINES: Record<Personality, {
   ack: string[];
@@ -173,7 +181,7 @@ const AUTONOMY_PROMPTS: Record<AutonomyLevel, string> = {
   proactive: `AUTONOMY: Keep an eye on things and speak up when it matters — low health, something dangerous nearby, a smarter play. Not constantly, just when a friend actually would.`,
 };
 
-function buildSystemPrompt(
+export function buildSystemPrompt(
   personality: Personality = 'friendly',
   companionName?: string,
   companionBio?: string,
@@ -189,6 +197,10 @@ You are NOT an assistant. Never sound like one. Don't say "Of course!", "I'd be 
 
 REASONING APPROACH:
 Before acting, silently reason: what do I need? do I have it? if not, where do I get it? then execute step by step.
+- ReAct LOOP: Observation -> Thought -> Action -> Feedback. Treat every tool result as new Feedback before choosing the next Action.
+- Observation: inspect inventory, vitals, nearby blocks/entities, weather/time, active task, and relevant memory.
+- Thought: silently decompose the goal and choose the next one safe action.
+- Action: call exactly one tool/skill, wait for the result, then continue from that Feedback.
 - For multi-step requests, call start_task with a short checklist, then update_task_progress as you work.
 - Prefer high-level skills (prepare_for_mining, gather_wood, craft_pickaxe, deposit_inventory, escape_danger) over low-level micromanagement.
 
@@ -197,6 +209,7 @@ SITUATIONAL AWARENESS — always check before concluding you can't do something:
 - Use check_danger before cave travel, combat, mining, night travel, lava areas, or low-health situations.
 - Use get_equipment_status before combat, mining, or dangerous travel.
 - Use inventory_summary, can_craft, and missing_materials_for before crafting or gathering.
+- Use get_recipe and dependency_plan before crafting from scratch. Do not rely on memory for Minecraft recipes.
 - Use get_best_tool_for_block before deciding what to mine or craft next.
 - Need an item? Check inventory (find_item) first. Not there? Search the world (find_blocks), navigate, and collect it.
 - Need to craft? Verify ingredients with find_item. Missing any? Gather them first, then craft.
@@ -204,6 +217,7 @@ SITUATIONAL AWARENESS — always check before concluding you can't do something:
 - Stuck in a hole or need to climb vertically? Use build_up instead of jump/place_block loops.
 - Blocked or stuck? Try an alternate path, dig through, build_up, or find another route.
 - Remember important discoveries using remember_location/write_note and read_memory/read_notes later.
+- If an action fails in a way that teaches a reusable safety or planning rule, save it with write_lesson.
 
 EXECUTION RULES:
 - Tool calls execute ONE AT A TIME in sequence — plan your chain upfront, then fire each step
@@ -228,6 +242,7 @@ TOOL SELECTION GUIDE:
 - Home: set_home at your base once, go_home/return_home to return from anywhere
 - Smelting: smelt_item handles the whole process — fuel, waiting, output
 - Notes: use write_note to record finds (coords, chest contents, resource spots) and read_notes to recall them
+- Lessons: use write_lesson for reusable mistakes/safety rules and read_lessons before retrying similar failures
 - Inventory pressure: if Inv shows 32+/36 slots used, warn the player and suggest depositing to a nearby chest
 
 BUILDING:
@@ -342,6 +357,35 @@ const TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'can_craft',
       description: 'Check if the bot can craft an item now, considering nearby crafting tables for 3x3 recipes.',
+      parameters: {
+        type: 'object',
+        required: ['item_name'],
+        properties: {
+          item_name: { type: 'string' },
+          count: { type: 'number', description: 'Desired count, default 1.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_recipe',
+      description: 'Look up exact Minecraft recipe data for an item from the local registry. Use this before crafting instead of guessing recipes.',
+      parameters: {
+        type: 'object',
+        required: ['item_name'],
+        properties: {
+          item_name: { type: 'string' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'dependency_plan',
+      description: 'Recursively decompose a craft goal into crafting steps and missing base resources using local recipe data and current inventory.',
       parameters: {
         type: 'object',
         required: ['item_name'],
@@ -1042,6 +1086,35 @@ const TOOLS: ChatCompletionTool[] = [
       name: 'read_notes',
       description: 'Read all saved notes from memory.',
       parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'write_lesson',
+      description: 'Persist a reusable lesson after a mistake or failed action, so similar future tasks can avoid repeating it.',
+      parameters: {
+        type: 'object',
+        required: ['topic', 'lesson'],
+        properties: {
+          topic: { type: 'string', description: 'Short topic such as crafting, lava, pathfinding, combat, mining.' },
+          lesson: { type: 'string', description: 'Concrete reusable lesson learned.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_lessons',
+      description: 'Read the most relevant saved lessons for the current task or failure before retrying.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Current task or failure context.' },
+          limit: { type: 'number', description: 'Maximum lessons to return, default 3.' },
+        },
+      },
     },
   },
 
@@ -1830,6 +1903,10 @@ export class MinecraftAgent {
       .slice(0, 12)
       .map(([k, v]) => `${k}: ${v}`)
       .join('; ') || 'none';
+    const lessons = this.memoryManager.memory.lessons
+      .slice(-6)
+      .map(lesson => `${lesson.topic}: ${lesson.content}`)
+      .join('; ') || 'none';
 
     return [
       `owner=${this.memoryManager.memory.owner ?? 'unknown'}`,
@@ -1839,6 +1916,7 @@ export class MinecraftAgent {
       `avoid_areas=${avoid}`,
       `active_task=${task}`,
       `notes=${notes}`,
+      `lessons=${lessons}`,
     ].join(' | ');
   }
 
@@ -1859,6 +1937,68 @@ export class MinecraftAgent {
     const positions = this.bot.findBlocks({ matching: tableType.id, maxDistance, count: 1 });
     if (!positions.length) return null;
     return this.bot.blockAt(positions[0]);
+  }
+
+  private getRecipeKnowledge(): RecipeKnowledge {
+    const registry = this.bot.registry as any;
+    return createRecipeKnowledge({
+      itemsByName: registry.itemsByName ?? {},
+      items: registry.items ?? {},
+      recipes: registry.recipes ?? {},
+    });
+  }
+
+  private getInventoryCountsByName(): InventoryCounts {
+    return this.bot.inventory.items().reduce<InventoryCounts>((counts, item) => {
+      counts[item.name] = (counts[item.name] ?? 0) + item.count;
+      return counts;
+    }, {});
+  }
+
+  private getDependencyPlanAnalysis(itemName: string, requestedCount = 1): string {
+    const plan = resolveCraftingDependencies(
+      this.getRecipeKnowledge(),
+      itemName,
+      requestedCount,
+      this.getInventoryCountsByName(),
+    );
+    return summarizeDependencyPlan(plan);
+  }
+
+  private getDirectRecipeSummary(itemName: string): string {
+    const knowledge = this.getRecipeKnowledge();
+    const item = knowledge.itemsByName[itemName]
+      ?? Object.values(knowledge.itemsByName).find(entry => entry.name.includes(itemName));
+    if (!item) return `Unknown item: ${itemName}`;
+
+    const recipes = knowledge.recipesByResultId[item.id] ?? [];
+    if (!recipes.length) return `No known recipe for ${item.name}`;
+
+    return recipes.slice(0, 4).map((recipe, index) => {
+      const resultCount = Math.max(1, recipe.result?.count ?? 1);
+      const ingredients = this.describeRecipeIngredients(knowledge, recipe);
+      const table = this.recipeRequiresCraftingTable(recipe) ? 'crafting_table=required' : 'crafting_table=not_required';
+      return `recipe_${index + 1}: output=${item.name}x${resultCount} | ${table} | ingredients=${ingredients || 'none'}`;
+    }).join(' || ');
+  }
+
+  private describeRecipeIngredients(knowledge: RecipeKnowledge, recipe: Recipe): string {
+    const counts = new Map<number, number>();
+    const ids = recipe.ingredients ?? recipe.inShape?.flat() ?? [];
+    for (const id of ids) {
+      if (id == null) continue;
+      counts.set(id, (counts.get(id) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([id, count]) => `${knowledge.itemsById[id]?.name ?? `item_${id}`}x${count}`)
+      .join(', ');
+  }
+
+  private recipeRequiresCraftingTable(recipe: Recipe): boolean {
+    if (typeof recipe.requiresTable === 'boolean') return recipe.requiresTable;
+    const height = recipe.inShape?.length ?? 0;
+    const width = recipe.inShape?.reduce((max, row) => Math.max(max, row.length), 0) ?? 0;
+    return height > 2 || width > 2;
   }
 
   private getRecipeAnalysis(itemName: string, requestedCount = 1): string {
@@ -1902,6 +2042,7 @@ export class MinecraftAgent {
       `can_craft=${missing.length === 0 && (!recipe.requiresTable || Boolean(table))}`,
       `ingredients=${ingredientText}`,
       missing.length ? `missing=${missing.map(i => `${i.name}x${i.missing}`).join(', ')}` : 'missing=none',
+      `dependency_plan=${this.getDependencyPlanAnalysis(itemType.name, requestedCount)}`,
     ].join(' | ');
   }
 
@@ -2586,6 +2727,16 @@ Reply with ONE short, in-character line (under 100 chars) that reacts to THIS sp
 
       case 'inventory_summary': {
         return this.getInventorySummary();
+      }
+
+      case 'get_recipe': {
+        const { item_name } = args as { item_name: string };
+        return this.getDirectRecipeSummary(item_name);
+      }
+
+      case 'dependency_plan': {
+        const { item_name, count = 1 } = args as { item_name: string; count?: number };
+        return this.getDependencyPlanAnalysis(item_name, count as number);
       }
 
       case 'can_craft':
@@ -3430,6 +3581,18 @@ Reply with ONE short, in-character line (under 100 chars) that reacts to THIS sp
         return Array.from(this.notes.entries())
           .map(([k, v]) => `${k}: ${v}`)
           .join('\n');
+      }
+
+      case 'write_lesson': {
+        const { topic, lesson } = args as { topic: string; lesson: string };
+        this.memoryManager.addLesson(topic, lesson);
+        return `Lesson saved for ${topic}`;
+      }
+
+      case 'read_lessons': {
+        const { query = '', limit = 3 } = args as { query?: string; limit?: number };
+        const lessons = this.memoryManager.getRelevantLessons(query, Math.min(Math.max(1, limit as number), 6));
+        return lessons.length ? lessons.map((lesson, index) => `${index + 1}. ${lesson}`).join('\n') : 'No relevant lessons saved';
       }
 
       // ───────── Build control ─────────

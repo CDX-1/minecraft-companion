@@ -64,9 +64,21 @@ export class StateMachine {
       if (now - this.lastHealthWarn > 5000) {
         this.log(`[state-machine] Health critical (${health}/20)`);
         this.lastHealthWarn = now;
+        if (this.memoryManager.memory.activeTask) {
+          this.memoryManager.memory.activeTask.progress.push(`Interrupted by survival check: health ${health}/20`);
+          this.memoryManager.memory.activeTask.progress = this.memoryManager.memory.activeTask.progress.slice(-20);
+          this.memoryManager.memory.activeTask.updatedAt = new Date().toISOString();
+          this.memoryManager.saveMemory();
+        }
         
         // Escape danger logic (hardcoded fast-path)
         await this.executeTool('escape_danger', {});
+        if (this.memoryManager.memory.activeTask) {
+          this.memoryManager.memory.activeTask.progress.push('Survival interruption handled; resume previous goal');
+          this.memoryManager.memory.activeTask.progress = this.memoryManager.memory.activeTask.progress.slice(-20);
+          this.memoryManager.memory.activeTask.updatedAt = new Date().toISOString();
+          this.memoryManager.saveMemory();
+        }
       }
     }
   }

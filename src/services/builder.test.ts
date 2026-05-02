@@ -48,5 +48,5 @@ test('BuildSession can execute transition ops through an injected executor', asy
     { x: 0, y: 64, z: 0, block: 'minecraft:stone' },
   ], 'test build', { x: 0, y: 64, z: 0, rotation: 0 });
 
-  assert.deepEqual(executed, ['0,64,0:minecraft:stone']);
+  assert.deepEqual(executed, ['0,64,0:minecraft:air', '0,64,0:minecraft:stone']);
 });

@@ -49,6 +49,7 @@ export type AgentMemory = {
   knownResources: StoredPosition[];
   avoidAreas: Array<StoredPosition & { reason: string }>;
   notes: Record<string, string>;
+  lessons: Array<{ topic: string; content: string; createdAt: string }>;
   activeTask?: ActiveTask;
 };
 
