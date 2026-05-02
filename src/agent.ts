@@ -243,6 +243,7 @@ CHAT RULES:
 - Keep every chat message under 100 characters (hard Minecraft limit)
 - One short sentence max — casual and direct
 - Only reply once at the end, never narrate each step
+- Your messages are sent directly to the player — never write "tell the player X" or "say X to the user"; just say it directly
 ${autonomyClause ? `\n${autonomyClause}` : ''}
 ${PERSONA_PROMPTS[personality]}`;
 }
