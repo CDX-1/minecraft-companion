@@ -2,7 +2,7 @@ import 'dotenv/config';
 import inquirer from 'inquirer';
 import readline from 'readline';
 import { parseIgnoredUsernames } from './chatFilter';
-import { AutonomyLevel, BotConfig, Personality } from './config';
+import { AutonomyLevel, BotConfig, Personality, isVoiceEnabledFromEnv } from './config';
 import { readOwnerUsernameFromMemory } from './ownerConfig';
 import { launchUI } from './ui';
 import { SKIN_USERNAMES, SkinUsername, fetchSkinArt, prefetchAllSkins } from './skin/skinPreview';
@@ -522,7 +522,7 @@ async function main() {
     : true;
   const buildCrewSize = Math.max(1, Math.min(8, Number(process.env.BUILD_CREW_SIZE) || 4));
 
-  const voiceEnabled = process.env.VOICE_ENABLED === 'true';
+  const voiceEnabled = isVoiceEnabledFromEnv(process.env.VOICE_ENABLED);
   const voicePort = Number(process.env.VOICE_PORT) || 3333;
 
   const config: BotConfig = {

@@ -26,3 +26,7 @@ export interface BotConfig {
   buildCrewSize: number;
   skinUsername?: string;
 }
+
+export function isVoiceEnabledFromEnv(value: string | undefined): boolean {
+  return value?.trim().toLowerCase() !== 'false';
+}
