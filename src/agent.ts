@@ -64,6 +64,7 @@ BAD responses: "Executing navigation protocol", "Task completed successfully", "
 
 TOOL SELECTION GUIDE:
 - Collecting blocks: break_and_collect gets the drop; dig_block just digs (use when drop doesn't matter)
+- Mining safety: break_and_collect uses Mineflayer's registry to equip valid tools and refuse unsafe harvests
 - Combat: kill_entity fights until dead; attack_entity is one hit (use for tagging or finishing)
 - Hostile areas: turn defend_self ON before exploring caves/nether, OFF when done
 - Chests: inspect_chest to see contents first, then deposit_to_chest or withdraw_from_chest
@@ -914,6 +915,54 @@ export class MinecraftAgent {
     return firstUser >= 0 ? trimmed.slice(firstUser) : [];
   }
 
+  private chooseBestRegistryHarvestTool(block: NonNullable<ReturnType<Bot['blockAt']>>) {
+    const harvestTools = block.harvestTools as Record<string, boolean> | undefined;
+    const inventoryItems = this.bot.inventory.items();
+
+    if (!harvestTools) {
+      return this.choosePreferredRegistryTool(block);
+    }
+
+    const validToolIds = new Set(Object.keys(harvestTools).map(Number));
+    return inventoryItems
+      .filter(item => validToolIds.has(item.type))
+      .sort((a, b) => this.getToolRank(b.name) - this.getToolRank(a.name))[0];
+  }
+
+  private choosePreferredRegistryTool(block: NonNullable<ReturnType<Bot['blockAt']>>) {
+    const material = block.material ?? '';
+    const preferredTool = material.includes('/') ? material.split('/').pop() : null;
+    if (!preferredTool) return undefined;
+
+    return this.bot.inventory.items()
+      .filter(item => item.name.endsWith(`_${preferredTool}`) || item.name === preferredTool)
+      .sort((a, b) => this.getToolRank(b.name) - this.getToolRank(a.name))[0];
+  }
+
+  private summarizeRegistryHarvestRequirement(block: NonNullable<ReturnType<Bot['blockAt']>>): string {
+    const harvestTools = block.harvestTools as Record<string, boolean> | undefined;
+    if (!harvestTools) return `${block.name} does not require a specific harvest tool.`;
+
+    const validTools = Object.keys(harvestTools)
+      .map(id => this.bot.registry.items[Number(id)]?.name)
+      .filter((name): name is string => Boolean(name))
+      .sort((a, b) => this.getToolRank(a) - this.getToolRank(b));
+
+    return validTools.length
+      ? `${block.name} requires one of: ${validTools.join(', ')}.`
+      : `${block.name} requires a harvest tool this bot cannot identify.`;
+  }
+
+  private getToolRank(itemName: string): number {
+    if (itemName.startsWith('netherite_')) return 6;
+    if (itemName.startsWith('diamond_')) return 5;
+    if (itemName.startsWith('iron_')) return 4;
+    if (itemName.startsWith('stone_')) return 3;
+    if (itemName.startsWith('golden_')) return 2;
+    if (itemName.startsWith('wooden_')) return 1;
+    return 0;
+  }
+
   private makeVec3(x: number, y: number, z: number) {
     if (!this.bot.entity) throw new Error('Bot not spawned');
     const v = this.bot.entity.position.clone();
@@ -1288,8 +1337,15 @@ export class MinecraftAgent {
         const targetPos = this.makeVec3(x, y, z);
         const block = bot.blockAt(targetPos);
         if (!block || block.name === 'air') return `No block at (${x}, ${y}, ${z})`;
-        if (!bot.canDigBlock(block)) return `Cannot dig ${block.name} (wrong tool or unbreakable)`;
         const blockName = block.name;
+        const harvestTool = this.chooseBestRegistryHarvestTool(block);
+        if (harvestTool) {
+          await bot.equip(harvestTool, 'hand');
+        } else if (block.harvestTools) {
+          return this.summarizeRegistryHarvestRequirement(block);
+        }
+
+        if (!bot.canDigBlock(block)) return `Cannot dig ${block.name} (wrong tool or unbreakable)`;
 
         if (bot.entity.position.distanceTo(targetPos) > 4) await this.navigateTo(x, y, z, 2, 30000);
         await bot.dig(block);
