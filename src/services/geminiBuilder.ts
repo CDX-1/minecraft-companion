@@ -31,6 +31,55 @@ const VENV_PYTHON = process.platform === 'win32'
 
 const SYSTEM_INSTRUCTION = `Output a runnable Python script using \`mcschematic\` that builds the requested structure (min corner at 0,0,0) and saves it via .save(sys.argv[1], sys.argv[2], mcschematic.Version.JE_1_20_1). Python only, no markdown fences.`;
 
+const FLASH_MODEL = process.env.GEMINI_FLASH_MODEL || 'gemini-3-flash-preview';
+const PRO_MODEL = process.env.GEMINI_PRO_MODEL || process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
+
+// Two-pass: dead-simple massing (flash, no thinking) so the player sees
+// SOMETHING almost immediately, then a full design pass (pro w/ thinking) that
+// iterates on the massing script while the bot is mid-render.
+const PASS_PROMPTS: { label: string; instruction: string; model: string; thinkingBudget: number }[] = [
+  {
+    label: 'massing',
+    model: FLASH_MODEL,
+    thinkingBudget: 0,
+    instruction: [
+      'PASS 1 — ROUGH MASSING. Output the simplest possible blocky placeholder for the requested structure.',
+      'Pick ONE primary block that fits the theme. You may use up to one secondary block for the roof if obvious.',
+      'Just get the footprint, walls, floors, and a flat or simple pitched roof down. Rooms can be hollow.',
+      'Do NOT add windows, trim, decorations, overhangs, or interior detail.',
+      'Keep the script short and obviously correct — this is a placeholder that will be refined.',
+    ].join(' '),
+  },
+  {
+    label: 'design',
+    model: PRO_MODEL,
+    thinkingBudget: 4096,
+    instruction: [
+      'PASS 2 — DETAIL ON TOP OF EXISTING MASS. The previous script defines the load-bearing geometry of this build. You MUST preserve it.',
+      '',
+      'HARD RULES — read carefully, these are not suggestions:',
+      '1. EVERY block placed by pass 1 must remain in the same position with the same block type, with these narrow exceptions:',
+      '   (a) you may carve out window/door openings (set to air) — at most ~10% of wall blocks total.',
+      '   (b) you may swap individual blocks to a contrasting accent block for trim/banding — at most ~10% of pass-1 blocks total.',
+      '2. You MUST NOT change the primary block type of pass 1 to a different material across the board. If pass 1 used cobblestone walls, the walls stay cobblestone. Pick accents that COMPLEMENT the existing palette.',
+      '3. You MUST NOT shrink, expand, or move the footprint or wall lines of pass 1.',
+      '',
+      'WHAT YOU SHOULD ADD (this is where the design comes from — by extension, not replacement):',
+      '   - Roof overhangs that extend OUTWARD past pass 1\'s walls (1 block on all sides).',
+      '   - A base course / plinth that extends OUTWARD past the walls at ground level (slabs or a complementary block).',
+      '   - Trim bands, pilasters, or corner quoins ATTACHED to the outside of pass 1\'s walls.',
+      '   - A more interesting roof BUILT ABOVE pass 1\'s roof (pitched, stepped, or layered) — keep pass 1\'s roof blocks underneath as structure, or replace them only if pass 1\'s roof was a flat slab.',
+      '   - Window/door FRAMES around the openings you carve.',
+      '   - Decorations placed AROUND or ON TOP OF the structure: lanterns on walls, a few flower pots or oak-leaf bushes at the base, a barrel, a hanging sign, sparingly. Not a ring of foliage around the whole building.',
+      '   - Interior lighting (lanterns, sea lanterns) placed inside the existing volume.',
+      '',
+      'THINK OF PASS 1 AS A SCULPTURE THAT IS ALREADY CARVED. Your job is to dress it — add the roof tiles, the molding, the lanterns, the planter boxes — not to re-carve it.',
+      '',
+      'OUTPUT: the COMPLETE updated Python script. It must re-place all pass-1 blocks (so the script is self-contained) AND add your additions. This is the final pass.',
+    ].join('\n'),
+  },
+];
+
 function getApiKey(): string {
   const key = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
   if (!key) throw new Error('GEMINI_API_KEY not set in environment');
@@ -39,9 +88,10 @@ function getApiKey(): string {
 
 type GeminiTurn = { role: 'user' | 'model'; text: string };
 
-async function callGemini(turns: GeminiTurn[]): Promise<string> {
+async function callGemini(turns: GeminiTurn[], opts: { model?: string; thinkingBudget?: number } = {}): Promise<string> {
   const apiKey = getApiKey();
-  const model = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
+  const model = opts.model || PRO_MODEL;
+  const thinkingBudget = opts.thinkingBudget ?? 200;
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const body = {
@@ -50,7 +100,7 @@ async function callGemini(turns: GeminiTurn[]): Promise<string> {
     generationConfig: {
       temperature: 0.7,
       maxOutputTokens: 24576,
-      thinkingConfig: { thinkingBudget: 2000 },
+      thinkingConfig: { thinkingBudget },
     },
   };
 
@@ -214,48 +264,111 @@ function unwrap(node: NbtNode | undefined): unknown {
   return (node as { value: unknown }).value;
 }
 
-export async function buildFromPrompt(userPrompt: string, log: (msg: string) => void): Promise<GeneratedBuild> {
+export interface BuildPassEvent {
+  pass: number;
+  totalPasses: number;
+  label: string;
+  build: GeneratedBuild;
+  isFinal: boolean;
+}
+
+export async function buildFromPrompt(
+  userPrompt: string,
+  log: (msg: string) => void,
+  onPass?: (event: BuildPassEvent) => Promise<void> | void,
+): Promise<GeneratedBuild> {
   await ensureMcschematic(log);
 
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mc-build-'));
-  const scriptPath = path.join(tmpDir, 'build.py');
   const schemName = 'out';
-  const schemPath = path.join(tmpDir, `${schemName}.schem`);
 
-  log('[gemini-build] asking Gemini for build script...');
-  const turns: GeminiTurn[] = [{ role: 'user', text: userPrompt }];
-  let script = await callGemini(turns);
+  // Three-pass refinement: massing → depth → polish. Each pass compiles,
+  // runs, and renders so the player sees the structure evolve. Low thinking
+  // budget keeps each call fast — quality accrues across passes.
+  const turns: GeminiTurn[] = [];
+  let script = '';
+  let finalBuild: GeneratedBuild | null = null;
+  const totalPasses = PASS_PROMPTS.length;
 
-  // Syntax-check loop: Gemini occasionally truncates or emits bad Python.
-  // Compile-check first; on failure, hand the error back and ask for a fix.
-  const MAX_FIX_ATTEMPTS = 2;
-  for (let attempt = 0; attempt <= MAX_FIX_ATTEMPTS; attempt++) {
-    await fs.writeFile(scriptPath, script, 'utf8');
-    const check = await runChild(VENV_PYTHON, ['-m', 'py_compile', scriptPath], log);
-    if (check.code === 0) break;
-    if (attempt === MAX_FIX_ATTEMPTS) {
-      throw new Error(`Generated script has syntax errors after ${MAX_FIX_ATTEMPTS} fix attempts: ${check.stderr.slice(0, 400)}`);
+  for (let pass = 0; pass < totalPasses; pass++) {
+    const { label, instruction, model, thinkingBudget } = PASS_PROMPTS[pass];
+    const isFinal = pass === totalPasses - 1;
+    log(`[gemini-build] pass ${pass + 1}/${totalPasses} (${label}) via ${model}...`);
+    if (pass === 0) {
+      turns.push({ role: 'user', text: `${instruction}\n\nUser request: ${userPrompt}` });
+    } else {
+      turns.push({ role: 'model', text: script });
+      turns.push({ role: 'user', text: `${instruction}\n\nOriginal user request: ${userPrompt}\n\nOutput the COMPLETE updated script (Python only, no markdown fences). Do not truncate.` });
     }
-    log(`[gemini-build] syntax error, asking Gemini to fix (attempt ${attempt + 1})...`);
-    turns.push({ role: 'model', text: script });
-    turns.push({ role: 'user', text: `Your script has a Python syntax error. Fix it and output the COMPLETE corrected script (no markdown fences, Python only). Make sure the script is not truncated.\n\nError:\n${check.stderr.slice(0, 800)}` });
-    script = await callGemini(turns);
+    script = await callGemini(turns, { model, thinkingBudget });
+
+    // Per-pass scratch dir so intermediate schems don't collide.
+    const passDir = path.join(tmpDir, `pass${pass}`);
+    await fs.mkdir(passDir, { recursive: true });
+    const scriptPath = path.join(passDir, 'build.py');
+    const schemPath = path.join(passDir, `${schemName}.schem`);
+
+    // Intermediate passes: best-effort. If syntax/run fails, skip the render
+    // and keep going — the demo doesn't stall on a flaky middle pass.
+    // Final pass: must succeed, so it gets the syntax-fix retry loop.
+    let build: GeneratedBuild | null = null;
+    try {
+      if (isFinal) {
+        const MAX_FIX_ATTEMPTS = 2;
+        for (let attempt = 0; attempt <= MAX_FIX_ATTEMPTS; attempt++) {
+          await fs.writeFile(scriptPath, script, 'utf8');
+          const check = await runChild(VENV_PYTHON, ['-m', 'py_compile', scriptPath], log);
+          if (check.code === 0) break;
+          if (attempt === MAX_FIX_ATTEMPTS) {
+            throw new Error(`Generated script has syntax errors after ${MAX_FIX_ATTEMPTS} fix attempts: ${check.stderr.slice(0, 400)}`);
+          }
+          log(`[gemini-build] syntax error, asking Gemini to fix (attempt ${attempt + 1})...`);
+          turns.push({ role: 'model', text: script });
+          turns.push({ role: 'user', text: `Your script has a Python syntax error. Fix it and output the COMPLETE corrected script (no markdown fences, Python only). Make sure the script is not truncated.\n\nError:\n${check.stderr.slice(0, 800)}` });
+          script = await callGemini(turns, { model, thinkingBudget });
+        }
+      } else {
+        await fs.writeFile(scriptPath, script, 'utf8');
+        const check = await runChild(VENV_PYTHON, ['-m', 'py_compile', scriptPath], log);
+        if (check.code !== 0) {
+          log(`[gemini-build] pass ${pass + 1} script has syntax errors, skipping render`);
+          continue;
+        }
+      }
+
+      const run = await runChild(VENV_PYTHON, [scriptPath, passDir, schemName], log);
+      if (run.code !== 0) {
+        if (isFinal) throw new Error(`Build script failed (exit ${run.code}): ${run.stderr.slice(0, 400)}`);
+        log(`[gemini-build] pass ${pass + 1} script failed at runtime, skipping render`);
+        continue;
+      }
+      try { await fs.access(schemPath); } catch {
+        if (isFinal) throw new Error(`Build script ran but no .schem produced at ${schemPath}`);
+        continue;
+      }
+
+      build = await parseSchem(schemPath);
+      build.description = userPrompt.slice(0, 60);
+      log(`[gemini-build] pass ${pass + 1} parsed: ${build.blocks.length} blocks, ${build.width}×${build.height}×${build.height}`);
+    } catch (err) {
+      if (isFinal) throw err;
+      log(`[gemini-build] pass ${pass + 1} errored, skipping render: ${(err as Error).message}`);
+      continue;
+    }
+
+    if (build) {
+      if (isFinal) finalBuild = build;
+      if (onPass) {
+        try { await onPass({ pass, totalPasses, label, build, isFinal }); }
+        catch (err) { log(`[gemini-build] onPass handler threw: ${(err as Error).message}`); }
+      }
+    }
   }
 
-  log('[gemini-build] running generated script...');
-  const run = await runChild(VENV_PYTHON, [scriptPath, tmpDir, schemName], log);
-  if (run.code !== 0) {
-    throw new Error(`Build script failed (exit ${run.code}): ${run.stderr.slice(0, 400)}`);
-  }
-  try { await fs.access(schemPath); }
-  catch { throw new Error(`Build script ran but no .schem produced at ${schemPath}`); }
-
-  const result = await parseSchem(schemPath);
-  result.description = userPrompt.slice(0, 60);
-  log(`[gemini-build] parsed schem: ${result.blocks.length} blocks, ${result.width}×${result.height}×${result.length}`);
+  if (!finalBuild) throw new Error('All build passes failed');
 
   // best-effort cleanup
   fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
 
-  return result;
+  return finalBuild;
 }

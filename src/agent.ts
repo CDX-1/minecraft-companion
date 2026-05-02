@@ -6,7 +6,7 @@ import { Movements, goals } from 'mineflayer-pathfinder';
 import { Vec3 } from 'vec3';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
 import { BuildSession, BuildStatus } from './services/builder';
-import { buildFromPrompt } from './services/geminiBuilder';
+import { buildFromPrompt, GeneratedBuild } from './services/geminiBuilder';
 
 function looksLikeBuildIntent(message: string): boolean {
   return /\b(build|construct|erect|put up|create me|design me|make me a|spawn me a|tower|house|castle|villa|mansion|dome|sphere|pyramid|wall|bridge|arch|cube|staircase|obelisk|fountain|temple|shrine|cathedral|church|cottage|dock|pier|statue|monument|sakura|cherry blossom|dragon|death star)\b/i.test(message);
@@ -2143,38 +2143,90 @@ export class MinecraftAgent {
 
     const lines = BUILD_VOICELINES[this.personality];
     this.log(`[gemini-build] generating: "${message}"`);
-    const generated = await buildFromPrompt(message, this.log);
+
+    // Lock origin from the first pass so all passes render in the same spot
+    // and replay() diffs cleanly across them (player sees the structure evolve).
+    const origin = this.builder.defaultOrigin(playerCtx);
+    const placeBuild = (b: GeneratedBuild) => {
+      const cx = Math.floor(b.width / 2);
+      const cz = Math.floor(b.length / 2);
+      return b.blocks.map(blk => ({
+        x: origin.x + blk.x - cx,
+        y: origin.y + blk.y,
+        z: origin.z + blk.z - cz,
+        block: blk.block,
+      }));
+    };
+
+    // Streaming render: each pass kicks off a replay immediately and we DON'T
+    // await it. When the next pass arrives, we cancel the in-flight render and
+    // start the next one — BuildSession.applyTransition diffs against whatever
+    // got placed so far, so it just keeps editing the structure live.
+    let announcedStart = false;
+    let announcedMid = false;
+    let finalArrived = false;
+    // ~12 blocks/sec base, stretching up to ~2 blocks/sec if the final pass
+    // is slow and we're nearing the end of the massing render.
+    const BASE_DELAY_MS = 80;
+    const MAX_DELAY_MS = 500;
+    const onReplayProgress = (s: BuildStatus): void => {
+      this.onBuildStatus?.(s);
+      if (s.phase !== 'building') return;
+      if (!announcedStart && s.placed > 0) {
+        announcedStart = true;
+        this.onAutonomousMessage?.(pickLine(lines.start));
+      }
+      if (!announcedMid && s.total > 0 && s.placed / s.total >= 0.5) {
+        announcedMid = true;
+        this.onAutonomousMessage?.(pickLine(lines.mid));
+      }
+      // If the final design hasn't arrived and we're past 70% of massing,
+      // stretch the delay so we don't finish and stand idle. Quadratic ramp
+      // from BASE at 70% to MAX at 100%.
+      if (!finalArrived && s.total > 0) {
+        const frac = s.placed / s.total;
+        if (frac > 0.7) {
+          const t = Math.min(1, (frac - 0.7) / 0.3);
+          const delay = BASE_DELAY_MS + (MAX_DELAY_MS - BASE_DELAY_MS) * t * t;
+          this.builder.setFrameDelay(delay);
+        }
+      } else {
+        this.builder.setFrameDelay(BASE_DELAY_MS);
+      }
+    };
+
+    let lastReplay: Promise<unknown> | null = null;
+    const startReplay = (build: GeneratedBuild, label: string, isFinal: boolean): void => {
+      const blocks = placeBuild(build);
+      if (!blocks.length) return;
+      const desc = isFinal
+        ? `${build.description} (${build.width}×${build.height}×${build.length}, ${blocks.length} blocks)`
+        : `${build.description} — ${label}`;
+      this.log(`[gemini-build] rendering ${label} — ${blocks.length} blocks${isFinal ? ' (final)' : ''}`);
+      if (isFinal) finalArrived = true;
+      // Cancel any in-flight render; applyTransition will diff from whatever
+      // got placed so far into the new target.
+      this.builder.cancelBuild();
+      this.builder.setFrameDelay(BASE_DELAY_MS);
+      lastReplay = this.builder.awaitIdle()
+        .then(() => this.builder.replay(blocks, desc, origin, onReplayProgress))
+        .catch(err => {
+          this.log(`[gemini-build] render failed (${label}): ${(err as Error).message}`);
+        });
+    };
+
+    const generated = await buildFromPrompt(message, this.log, async ({ pass, totalPasses, label, build, isFinal }) => {
+      startReplay(build, `pass ${pass + 1}/${totalPasses} (${label})`, isFinal);
+    });
     if (!generated.blocks.length) {
       this.onAutonomousMessage?.(pickLine(lines.fail));
       return '';
     }
 
-    const origin = this.builder.defaultOrigin(playerCtx);
-    const cx = Math.floor(generated.width / 2);
-    const cz = Math.floor(generated.length / 2);
-    const placed = generated.blocks.map(b => ({
-      x: origin.x + b.x - cx,
-      y: origin.y + b.y,
-      z: origin.z + b.z - cz,
-      block: b.block,
-    }));
-    const desc = `${generated.description} (${generated.width}×${generated.height}×${generated.length}, ${placed.length} blocks)`;
-
-    let announcedStart = false;
-    let announcedMid = false;
-    const { status } = await this.builder.replay(placed, desc, origin, s => {
-      this.onBuildStatus?.(s);
-      if (s.phase === 'building') {
-        if (!announcedStart && s.placed > 0) {
-          announcedStart = true;
-          this.onAutonomousMessage?.(pickLine(lines.start));
-        }
-        if (!announcedMid && s.total > 0 && s.placed / s.total >= 0.5) {
-          announcedMid = true;
-          this.onAutonomousMessage?.(pickLine(lines.mid));
-        }
-      }
-    });
+    // Wait for whichever replay is currently running to finish (final pass was
+    // kicked off inside the onPass callback above).
+    if (lastReplay) await lastReplay;
+    const status = this.builder.getStatus();
     if (status.phase === 'error') {
       this.onAutonomousMessage?.(pickLine(lines.fail));
       return '';

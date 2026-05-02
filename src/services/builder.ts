@@ -69,15 +69,25 @@ export class BuildSession {
   ) {
     void _log;
     this.opts = {
-      frameDelayMs: opts.frameDelayMs ?? 25,
-      blocksPerFrame: opts.blocksPerFrame ?? 24,
+      frameDelayMs: opts.frameDelayMs ?? 80,
+      blocksPerFrame: opts.blocksPerFrame ?? 1,
       flyAlong: opts.flyAlong ?? true,
       maxFoundationDrop: opts.maxFoundationDrop ?? 24,
     };
+    this.activeFrameDelayMs = this.opts.frameDelayMs;
   }
+  private activeFrameDelayMs: number;
 
   getStatus(): BuildStatus { return { ...this.status }; }
   hasActive(): boolean { return this.current !== null; }
+  /** Resolves once any in-flight build/transition has settled. */
+  async awaitIdle(): Promise<void> {
+    if (this.buildInFlight) { try { await this.buildInFlight; } catch { /* ignore */ } }
+  }
+  /** Adjust per-frame delay mid-render. Used to stretch pass 1 if pass 2 is slow. */
+  setFrameDelay(ms: number): void {
+    this.activeFrameDelayMs = Math.max(0, ms);
+  }
 
   defaultOrigin(player?: PlayerContext): Origin {
     const p = player?.position ?? this.bot.entity?.position;
@@ -238,14 +248,17 @@ export class BuildSession {
       return this.getStatus();
     }
 
+    this.activeFrameDelayMs = this.opts.frameDelayMs;
     const run = (async (): Promise<BuildStatus> => {
       try {
-        const { blocksPerFrame, frameDelayMs } = this.opts;
+        const { blocksPerFrame } = this.opts;
         const hoverY = (next?.bounds?.max.y ?? old?.bounds?.max.y ?? 64) + 4;
+        let executed = 0;
         for (let i = 0; i < ops.length; i += blocksPerFrame) {
           if (this.buildAbort) {
+            this.current = partialAfter(old, ops, executed, next);
             this.status.phase = 'cancelled';
-            this.status.message = `Cancelled at ${i}/${ops.length}`;
+            this.status.message = `Cancelled at ${executed}/${ops.length}`;
             onProgress?.(this.getStatus());
             return this.getStatus();
           }
@@ -255,9 +268,10 @@ export class BuildSession {
           for (const op of frame) {
             this.bot.chat(`/setblock ${op.x} ${op.y} ${op.z} ${op.block}`);
           }
+          executed = end;
           this.status.placed = end;
           onProgress?.(this.getStatus());
-          if (frameDelayMs > 0 && end < ops.length) await wait(frameDelayMs);
+          if (this.activeFrameDelayMs > 0 && end < ops.length) await wait(this.activeFrameDelayMs);
         }
         this.status.phase = 'done';
         this.status.message = next ? `Built ${next.description}` : 'Demolished';
@@ -332,6 +346,43 @@ function emptyStatus(): BuildStatus {
   return { phase: 'idle', description: '', total: 0, placed: 0, origin: null, bounds: null, material: null, type: null };
 }
 function key(b: { x: number; y: number; z: number }): string { return `${b.x},${b.y},${b.z}`; }
+/**
+ * Reconstruct the PlacedBuild state after only the first `executed` ops of a
+ * cancelled transition have run. Starting from `old`, applies each executed op
+ * (air = removal, anything else = set/replace). Result is what's actually on the
+ * ground, so the NEXT transition diffs against reality, not the aborted target.
+ */
+function partialAfter(
+  old: PlacedBuild | null,
+  ops: BlockPlacement[],
+  executed: number,
+  next: PlacedBuild | null,
+): PlacedBuild | null {
+  const map = new Map<string, BlockPlacement>();
+  if (old) for (const b of old.blocks) map.set(key(b), b);
+  for (let i = 0; i < executed && i < ops.length; i++) {
+    const op = ops[i];
+    const k = key(op);
+    if (op.block.includes('air')) map.delete(k);
+    else map.set(k, op);
+  }
+  const blocks = [...map.values()];
+  if (!blocks.length) return null;
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  for (const b of blocks) {
+    if (b.x < minX) minX = b.x; if (b.y < minY) minY = b.y; if (b.z < minZ) minZ = b.z;
+    if (b.x > maxX) maxX = b.x; if (b.y > maxY) maxY = b.y; if (b.z > maxZ) maxZ = b.z;
+  }
+  const ref = next ?? old!;
+  return {
+    blocks,
+    bounds: { min: { x: minX, y: minY, z: minZ }, max: { x: maxX, y: maxY, z: maxZ } },
+    origin: ref.origin,
+    description: ref.description,
+    material: ref.material,
+  };
+}
 function wait(ms: number): Promise<void> { return new Promise(r => setTimeout(r, ms)); }
 function normalize(name: string): string {
   const trimmed = name.trim().toLowerCase();
