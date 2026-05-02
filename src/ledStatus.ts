@@ -4,7 +4,10 @@ import { existsSync, readdirSync } from 'node:fs';
 export type LedStatus = 'green' | 'yellow' | 'red';
 
 export interface LedStatusController {
+  /** Health overlay: GREEN clears alert strip (shows mood-only); yellow/red overlays. */
   setStatus: (status: LedStatus, reason?: string) => void;
+  /** Emotional baseline 0 (upset) — 100 (delighted); only visible while alert is GREEN/off. */
+  setMood: (score01To100: number, reason?: string) => void;
   close: () => void;
 }
 
@@ -31,8 +34,11 @@ export function createLedStatusController(options: LedStatusOptions = {}): LedSt
   }
 
   let currentStatus: LedStatus | null = null;
+  let currentMood: number | null = null;
   let isOpen = false;
-  const pending: Array<{ status: LedStatus; reason?: string }> = [];
+
+  let pendingOperational: { status: LedStatus; reason?: string } | null = null;
+  let pendingMood: number | null = null;
 
   const port = new SerialPort({
     path: portPath,
@@ -43,7 +49,8 @@ export function createLedStatusController(options: LedStatusOptions = {}): LedSt
   port.on('open', () => {
     isOpen = true;
     options.log?.(`ESP32 LED status connected on ${portPath} @ ${baudRate}`);
-    flushPending();
+    flushOperationalPending();
+    flushMoodPending();
   });
 
   port.on('error', (err) => {
@@ -58,7 +65,7 @@ export function createLedStatusController(options: LedStatusOptions = {}): LedSt
     if (err) options.warn?.(`ESP32 LED serial unavailable on ${portPath}: ${err.message}`);
   });
 
-  function writeStatus(status: LedStatus, reason?: string) {
+  function writeOperational(status: LedStatus, reason?: string) {
     const command = `${STATUS_COMMANDS[status]}\n`;
     port.write(command, (err) => {
       if (err) {
@@ -69,10 +76,34 @@ export function createLedStatusController(options: LedStatusOptions = {}): LedSt
     });
   }
 
-  function flushPending() {
-    const last = pending.pop();
-    pending.length = 0;
-    if (last) writeStatus(last.status, last.reason);
+  function writeMood(score: number, reason?: string) {
+    const line = `MOOD ${score}\n`;
+    port.write(line, (err) => {
+      if (err) {
+        options.warn?.(`ESP32 LED mood write failed: ${err.message}`);
+        return;
+      }
+      options.log?.(`LED mood ${score}${reason ? `: ${reason}` : ''}`);
+    });
+  }
+
+  function flushOperationalPending() {
+    if (!pendingOperational) return;
+    const last = pendingOperational;
+    pendingOperational = null;
+    writeOperational(last.status, last.reason);
+  }
+
+  function flushMoodPending() {
+    if (pendingMood === null) return;
+    const s = pendingMood;
+    pendingMood = null;
+    writeMood(s);
+  }
+
+  function clampMood(score: number): number {
+    if (!Number.isFinite(score)) return 50;
+    return Math.max(0, Math.min(100, Math.round(score)));
   }
 
   return {
@@ -80,11 +111,23 @@ export function createLedStatusController(options: LedStatusOptions = {}): LedSt
       if (status === currentStatus) return;
       currentStatus = status;
       if (!isOpen) {
-        pending.push({ status, reason });
+        pendingOperational = { status, reason };
         return;
       }
-      writeStatus(status, reason);
+      writeOperational(status, reason);
     },
+
+    setMood: (score01To100, reason) => {
+      const score = clampMood(score01To100);
+      if (score === currentMood) return;
+      currentMood = score;
+      if (!isOpen) {
+        pendingMood = score;
+        return;
+      }
+      writeMood(score, reason);
+    },
+
     close: () => {
       if (port.isOpen) port.close();
     },
@@ -141,6 +184,7 @@ function detectSerialPort(): string | undefined {
 function noopController(): LedStatusController {
   return {
     setStatus: () => undefined,
+    setMood: () => undefined,
     close: () => undefined,
   };
 }

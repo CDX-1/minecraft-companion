@@ -9,6 +9,7 @@ test('LED status controller is a no-op when no serial port is configured', () =>
     controller.setStatus('green', 'test');
     controller.setStatus('yellow', 'test');
     controller.setStatus('red', 'test');
+    controller.setMood(73, 'neutral test');
     controller.close();
   });
 });

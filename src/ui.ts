@@ -5,6 +5,7 @@ import { shouldIgnoreChatSender } from './chatFilter';
 import { parseChatCommand } from './commands';
 import { BotConfig } from './config';
 import { MinecraftAgent } from './agent';
+import { classifyDamageMoodDelta, createMoodTracker, type MoodTracker } from './botMood';
 import { GlobalPushToTalk, startGlobalPushToTalk } from './globalPushToTalk';
 import { createLedStatusController, LedStatusController } from './ledStatus';
 import { createElevenLabsSpeaker, ElevenLabsSpeaker } from './services/elevenLabs';
@@ -97,11 +98,13 @@ export function launchUI(config: BotConfig): void {
   let voiceSpeaker: ElevenLabsSpeaker | null = null;
   let globalPushToTalk: GlobalPushToTalk | null = null;
   let ledStatus: LedStatusController | null = null;
+  let moodTracker: MoodTracker | null = null;
   let agent: MinecraftAgent | null = null;
 
   const openaiApiKey = process.env.OPENAI_API_KEY?.trim();
 
   screen.key(['C-c'], () => {
+    moodTracker?.dispose();
     ledStatus?.setStatus('red', 'companion shutting down');
     ledStatus?.close();
     globalPushToTalk?.close();
@@ -143,6 +146,11 @@ export function launchUI(config: BotConfig): void {
     log: logSystem,
     warn: logWarning,
   });
+  moodTracker = createMoodTracker({
+    log: logSystem,
+    onScoreChange: (score) => ledStatus?.setMood(score),
+  });
+
   ledStatus.setStatus('yellow', 'companion starting');
 
   function loadPluginSafely(name: string, plugin: Parameters<Bot['loadPlugin']>[0]) {
@@ -317,23 +325,41 @@ export function launchUI(config: BotConfig): void {
     return lines.filter(Boolean).join('\n');
   }
 
+  function moodTelemetryBlock(score: number): string {
+    const clamped = Math.max(0, Math.min(100, Math.round(score)));
+    const barWidth = 14;
+    const filled = Math.round((clamped / 100) * barWidth);
+    const empty = Math.max(0, barWidth - filled);
+    const bar = '█'.repeat(filled) + '░'.repeat(empty);
+    const tierLabel =
+      clamped >= 82 ? '{green-fg}great{/green-fg}'
+      : clamped >= 65 ? '{green-fg}good{/green-fg}'
+      : clamped >= 48 ? '{yellow-fg}mixed{/yellow-fg}'
+      : clamped >= 28 ? '{blue-fg}low{/blue-fg}'
+      : '{red-fg}bad{/red-fg}';
+    return `\n{bold}Mood{/bold}\n ${tierLabel}  ${clamped}/100\n [${bar}]`;
+  }
+
   function renderInfo() {
     if (!bot?.entity) return;
     const hp = (bot.health ?? 0).toFixed(1);
     const food = bot.food ?? 0;
     const pos = bot.entity.position;
     const buildStatus = agent?.getBuildStatus();
+    const moodScore = moodTracker?.getScore() ?? 50;
     if ((bot.health ?? 20) <= 6) {
       ledStatus?.setStatus('red', 'low health');
     } else if ((bot.food ?? 20) <= 8 || !agent) {
       ledStatus?.setStatus('yellow', !agent ? 'agent unavailable' : 'low food');
     } else {
+      /** GREEN clears RED/YELLOW health overlay — underlying mood LEDs stay driven by gameplay. */
       ledStatus?.setStatus('green', 'online');
     }
     infoPanel.setContent(
       `{bold}Link{/bold}\n {green-fg}online{/green-fg} ${config.host}:${config.port}\n\n` +
       `{bold}Callsign{/bold}\n ${bot.username}\n\n` +
-      `{bold}Vitals{/bold}\n {red-fg}HP ${hp}/20{/red-fg}\n {green-fg}Food ${food}/20{/green-fg}\n\n` +
+      `{bold}Vitals{/bold}\n {red-fg}HP ${hp}/20{/red-fg}\n {green-fg}Food ${food}/20{/green-fg}` +
+      `${moodTelemetryBlock(moodScore)}\n\n` +
       `{bold}Coordinates{/bold}\n X ${pos.x.toFixed(1)}\n Y ${pos.y.toFixed(1)}\n Z ${pos.z.toFixed(1)}\n\n` +
       `{bold}Agent{/bold}\n ${agent ? '{green-fg}online{/green-fg}' : '{yellow-fg}basic commands{/yellow-fg}'}\n\n` +
       `{bold}Voice{/bold}\n ${voiceServer ? '{magenta-fg}listening page live{/magenta-fg}' : config.voiceEnabled ? '{yellow-fg}starting{/yellow-fg}' : '{gray-fg}disabled{/gray-fg}'}` +
@@ -343,6 +369,8 @@ export function launchUI(config: BotConfig): void {
   }
 
   function connect() {
+    let prevHealth = 20;
+
     bot = mineflayer.createBot({
       host: config.host,
       port: config.port,
@@ -356,6 +384,34 @@ export function launchUI(config: BotConfig): void {
     loadPluginSafely('mineflayer-pvp', pvpPlugin);
     loadPluginSafely('mineflayer-armor-manager', armorManager);
 
+    bot.on('spawn', () => {
+      prevHealth = bot.health ?? prevHealth;
+    });
+
+    bot.on('death', () => {
+      moodTracker?.bump(-26, 'death');
+    });
+
+    bot.on('health', () => {
+      const h = bot.health ?? 0;
+      if (h > 0 && prevHealth > h) {
+        moodTracker?.bump(
+          classifyDamageMoodDelta(prevHealth - h, 20),
+          `-${(prevHealth - h).toFixed(1)} HP`,
+        );
+      }
+      prevHealth = h;
+    });
+
+    bot.on('playerCollect', (collector, collected) => {
+      if (!bot.entity || collector.id !== bot.entity.id) return;
+
+      /** Skip XP arrows etc. (`getDroppedItem` only works for loose item-stack entities). */
+      const dropped = typeof collected.getDroppedItem === 'function' ? collected.getDroppedItem() : null;
+
+      moodTracker?.onCollectedItemId(dropped?.name);
+    });
+
     bot.once('spawn', () => {
       statusBar.setContent(
         ` {bold}MC COMPANION{/bold}  {gray-fg}target{/gray-fg} ${config.host}:${config.port}` +
@@ -366,6 +422,7 @@ export function launchUI(config: BotConfig): void {
       statusBar.style.bg = 'green';
       logSystem(`Spawned as ${bot.username}.`);
       ledStatus?.setStatus('yellow', 'spawned, checking systems');
+      ledStatus?.setMood(moodTracker?.getScore() ?? 50, 'spawn');
       infoTimer = setInterval(renderInfo, 1000);
       void loadAutoEatSafely();
       void (bot as any).armorManager?.equipAll?.().catch?.(() => undefined);
@@ -449,6 +506,9 @@ export function launchUI(config: BotConfig): void {
 
     bot.on('end', (reason) => {
       if (infoTimer) clearInterval(infoTimer);
+      moodTracker?.dispose();
+      moodTracker = null;
+
       ledStatus?.setStatus('red', 'bot disconnected');
       globalPushToTalk?.close();
       globalPushToTalk = null;
