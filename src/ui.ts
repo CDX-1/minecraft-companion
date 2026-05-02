@@ -218,6 +218,10 @@ export function launchUI(config: BotConfig): void {
         agent = new MinecraftAgent(bot, openaiApiKey, (msg) => {
           chatLog.log(`{gray-fg}${msg}{/gray-fg}`);
           screen.render();
+        }, (msg) => {
+          chatLog.log(`{yellow-fg}[auto] ${msg}{/yellow-fg}`);
+          botSay(msg);
+          screen.render();
         });
         chatLog.log(`{green-fg}[agent] GPT-4o-mini agent ready{/green-fg}`);
       } else {

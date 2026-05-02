@@ -48,6 +48,8 @@ TOOL SELECTION GUIDE:
 - Consumables / special items: use_item for potions, ender pearls, fishing rod, flint and steel, bone meal
 - Home: set_home at your base once, go_home to return from anywhere
 - Smelting: smelt_item handles the whole process — fuel, waiting, output
+- Notes: use write_note to record finds (coords, chest contents, resource spots) and read_notes to recall them
+- Inventory pressure: if Inv shows 32+/36 slots used, warn the player and suggest depositing to a nearby chest
 
 CHAT RULES:
 - Keep every chat message under 100 characters (hard Minecraft limit)
@@ -533,6 +535,29 @@ const TOOLS: ChatCompletionTool[] = [
       parameters: { type: 'object', properties: {} },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'write_note',
+      description: 'Save a note to memory. Use to record discoveries, coordinates, chest contents, or any info worth remembering across the session.',
+      parameters: {
+        type: 'object',
+        required: ['key', 'value'],
+        properties: {
+          key: { type: 'string', description: 'Short label for this note (e.g. "diamond_location", "home_chest")' },
+          value: { type: 'string', description: 'The note content to remember' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_notes',
+      description: 'Read all saved notes from memory.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
 ];
 
 export class MinecraftAgent {
@@ -544,18 +569,70 @@ export class MinecraftAgent {
   private defendActive = false;
   private defendTick: (() => void) | null = null;
   private lastDefendAttack = 0;
+  private lastAutoEat = 0;
+  private lastHealthWarn = 0;
+  private lastDamageWarn = 0;
+  private lastProximityWarn = 0;
+  private notes = new Map<string, string>();
+  private onAutonomousMessage?: (msg: string) => void;
 
   constructor(
     private bot: Bot,
     apiKey: string,
-    private log: (msg: string) => void
+    private log: (msg: string) => void,
+    onAutonomousMessage?: (msg: string) => void
   ) {
     this.openai = new OpenAI({ apiKey });
+    this.onAutonomousMessage = onAutonomousMessage;
+    if (onAutonomousMessage) this.startProactiveHooks();
   }
 
   private getMovements(): Movements {
     if (!this.movements) this.movements = new Movements(this.bot);
     return this.movements;
+  }
+
+  private startProactiveHooks(): void {
+    const bot = this.bot;
+
+    bot.on('health', () => {
+      const now = Date.now();
+      if ((bot.food ?? 20) <= 8 && now - this.lastAutoEat > 15000) {
+        this.lastAutoEat = now;
+        this.executeTool('eat', {})
+          .then(result => {
+            if (!result.startsWith('No food')) this.onAutonomousMessage?.(result);
+          })
+          .catch(() => {});
+      }
+      if ((bot.health ?? 20) <= 4 && now - this.lastHealthWarn > 8000) {
+        this.lastHealthWarn = now;
+        this.onAutonomousMessage?.("I'm almost dead, help!");
+      }
+    });
+
+    (bot as any).on('entityHurt', (entity: any) => {
+      if (!bot.entity || entity !== bot.entity) return;
+      const now = Date.now();
+      if (now - this.lastDamageWarn < 5000) return;
+      this.lastDamageWarn = now;
+      this.onAutonomousMessage?.('ouch! taking damage!');
+    });
+
+    bot.on('physicsTick', () => {
+      if (!bot.entity) return;
+      const now = Date.now();
+      if (now - this.lastProximityWarn < 10000) return;
+      const hostile = bot.nearestEntity(e => {
+        const dist = bot.entity!.position.distanceTo(e.position);
+        return dist <= 8 && HOSTILE_MOBS.has(e.name?.toLowerCase() ?? '');
+      });
+      if (hostile) {
+        this.lastProximityWarn = now;
+        const dist = bot.entity.position.distanceTo(hostile.position).toFixed(0);
+        this.onAutonomousMessage?.(`${hostile.name} ${dist}m away!`);
+      }
+    });
   }
 
   private tryFastPath(message: string, sender: string): string | null {
@@ -601,12 +678,44 @@ export class MinecraftAgent {
     const invSummary = invItems.length
       ? invItems.map(i => `${i.name}x${i.count}`).join(', ')
       : 'empty';
+    const slotsUsed = invItems.length;
 
     const timeOfDay = bot.time?.timeOfDay ?? 0;
     const timeLabel = timeOfDay < 13000 ? 'day' : 'night';
 
+    const xpLevel = (bot as any).experience?.level ?? 0;
+
+    const armorItems = [5, 6, 7, 8]
+      .map(i => (bot.inventory.slots as any[])[i])
+      .filter(Boolean)
+      .map((item: any) => item.name as string);
+    const armorSummary = armorItems.length ? armorItems.join(', ') : 'none';
+
+    const nearbyHostiles = pos
+      ? Object.values(bot.entities).filter(e => {
+          const dist = pos.distanceTo(e.position);
+          return dist <= 24 && HOSTILE_MOBS.has(e.name?.toLowerCase() ?? '');
+        })
+      : [];
+    const hostileSummary = nearbyHostiles.length
+      ? nearbyHostiles.slice(0, 5)
+          .map(e => `${e.name}(${pos!.distanceTo(e.position).toFixed(0)}m)`)
+          .join(', ')
+      : 'none';
+
     const state = pos
-      ? `Position: (${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}) | Health: ${(bot.health ?? 0).toFixed(0)}/20 | Food: ${bot.food ?? 0}/20 | Time: ${timeLabel} | Inventory: ${invSummary}`
+      ? [
+          `Pos: (${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})`,
+          `Health: ${(bot.health ?? 0).toFixed(0)}/20`,
+          `Food: ${bot.food ?? 0}/20`,
+          `XP: lvl ${xpLevel}`,
+          `Time: ${timeLabel}`,
+          `Defend: ${this.defendActive ? 'ON' : 'OFF'}`,
+          `Home: ${this.homePosition ? `(${this.homePosition.x.toFixed(0)}, ${this.homePosition.y.toFixed(0)}, ${this.homePosition.z.toFixed(0)})` : 'not set'}`,
+          `Armor: ${armorSummary}`,
+          `Inv: ${slotsUsed}/36 — ${invSummary}`,
+          `Nearby hostiles: ${hostileSummary}`,
+        ].join(' | ')
       : 'Not yet spawned';
 
     const messages: ChatCompletionMessageParam[] = [
@@ -1281,6 +1390,19 @@ export class MinecraftAgent {
         const { x, y, z } = this.homePosition;
         await this.navigateTo(x, y, z, 2, 60000);
         return `Arrived home at (${x.toFixed(1)}, ${y.toFixed(1)}, ${z.toFixed(1)})`;
+      }
+
+      case 'write_note': {
+        const { key, value } = args as { key: string; value: string };
+        this.notes.set(key, value);
+        return `Note saved: "${key}"`;
+      }
+
+      case 'read_notes': {
+        if (!this.notes.size) return 'No notes saved yet';
+        return Array.from(this.notes.entries())
+          .map(([k, v]) => `${k}: ${v}`)
+          .join('\n');
       }
 
       default:
