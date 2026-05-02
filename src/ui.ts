@@ -2,6 +2,7 @@ import blessed from 'blessed';
 import { exec } from 'node:child_process';
 import mineflayer, { Bot } from 'mineflayer';
 import { pathfinder, Movements, goals } from 'mineflayer-pathfinder';
+import { shouldIgnoreChatSender } from './chatFilter';
 import { BotConfig } from './config';
 import { MinecraftAgent } from './agent';
 import { createElevenLabsSpeaker, ElevenLabsSpeaker } from './services/elevenLabs';
@@ -247,7 +248,12 @@ export function launchUI(config: BotConfig): void {
     });
 
     bot.on('chat', (username, message) => {
-      if (username === bot.username) return;
+      if (shouldIgnoreChatSender(username, bot.username, config.ignoredUsernames)) {
+        chatLog.log(`{gray-fg}[ignored] <${username}> ${message}{/gray-fg}`);
+        screen.render();
+        return;
+      }
+
       chatLog.log(`{cyan-fg}<${username}>{/cyan-fg} ${message}`);
       screen.render();
 

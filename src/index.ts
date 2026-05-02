@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import inquirer from 'inquirer';
+import { parseIgnoredUsernames } from './chatFilter';
 import { BotConfig } from './config';
 import { launchUI } from './ui';
 
@@ -41,6 +42,13 @@ async function main() {
       name: 'username',
       message: 'Username:',
       default: process.env.MC_USERNAME ?? 'companion',
+    },
+    {
+      type: 'input',
+      name: 'ignoredUsernames',
+      message: 'Other bot usernames to ignore (comma-separated):',
+      default: process.env.MC_IGNORED_USERNAMES ?? '',
+      filter: parseIgnoredUsernames,
     },
     {
       type: 'list',

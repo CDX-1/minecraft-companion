@@ -5,12 +5,17 @@ interface VoiceServerOptions {
   onTranscript: (text: string) => void;
 }
 
+const TRANSCRIPT_COOLDOWN_MS = 3000;
+
 export interface VoiceServer {
   url: string;
   close: () => void;
 }
 
 export function startVoiceServer(options: VoiceServerOptions): Promise<VoiceServer> {
+  let lastTranscript = '';
+  let lastTranscriptAt = 0;
+
   const server = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
@@ -28,8 +33,13 @@ export function startVoiceServer(options: VoiceServerOptions): Promise<VoiceServ
       req.on('end', () => {
         try {
           const payload = JSON.parse(body) as { text?: unknown };
-          if (typeof payload.text === 'string') {
-            options.onTranscript(payload.text);
+          if (
+            typeof payload.text === 'string' &&
+            shouldAcceptTranscript(payload.text, lastTranscript, lastTranscriptAt, Date.now())
+          ) {
+            lastTranscript = normalizeTranscript(payload.text);
+            lastTranscriptAt = Date.now();
+            options.onTranscript(payload.text.trim());
           }
           res.writeHead(204);
           res.end();
@@ -57,7 +67,22 @@ export function startVoiceServer(options: VoiceServerOptions): Promise<VoiceServ
   });
 }
 
-function renderVoicePage(): string {
+export function normalizeTranscript(text: string): string {
+  return text.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+export function shouldAcceptTranscript(
+  text: string,
+  lastText: string,
+  lastAcceptedAt: number,
+  now: number
+): boolean {
+  const normalized = normalizeTranscript(text);
+  if (!normalized) return false;
+  return normalized !== lastText || now - lastAcceptedAt >= TRANSCRIPT_COOLDOWN_MS;
+}
+
+export function renderVoicePage(): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -127,6 +152,17 @@ function renderVoicePage(): string {
       recognition.interimResults = false;
       recognition.lang = 'en-US';
 
+      async function sendTranscript(text) {
+        if (!text.trim()) return;
+        lastEl.textContent = 'Last transcript: ' + text;
+
+        await fetch('/transcript', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ text }),
+        });
+      }
+
       recognition.onstart = () => {
         statusEl.textContent = 'Listening...';
         startButton.textContent = 'Listening';
@@ -134,14 +170,12 @@ function renderVoicePage(): string {
       };
 
       recognition.onresult = async (event) => {
-        const result = event.results[event.results.length - 1];
-        const text = result[0].transcript.trim();
-        lastEl.textContent = 'Last transcript: ' + text;
-        await fetch('/transcript', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ text }),
-        });
+        for (let i = event.resultIndex; i < event.results.length; i += 1) {
+          const result = event.results[i];
+          if (!result.isFinal) continue;
+          const text = result[0].transcript.trim();
+          await sendTranscript(text);
+        }
       };
 
       recognition.onerror = (event) => {
