@@ -6,6 +6,7 @@ import { AutonomyLevel, BotConfig, Personality, isVoiceEnabledFromEnv } from './
 import { readOwnerUsernameFromMemory } from './ownerConfig';
 import { launchUI } from './ui';
 import { SKIN_USERNAMES, SkinUsername, fetchSkinArt, prefetchAllSkins } from './skin/skinPreview';
+import { createElevenLabsSpeaker } from './services/elevenLabs';
 
 // ── ANSI palette ─────────────────────────────────────────────────────────────
 // Inspired by Charm/Linear: muted, confident, generous whitespace.
@@ -27,6 +28,24 @@ const C = {
   rose: '\x1b[38;2;230;130;130m',
   violet: '\x1b[38;2;180;150;240m',
   emerald: '\x1b[38;2;120;200;160m',
+};
+
+// Silence specific noisy warnings coming from underlying libs (Beflayer/mineflayer)
+const __originalWarn = console.warn.bind(console);
+console.warn = (...args: unknown[]) => {
+  try {
+    const msg = String(args[0] ?? '');
+    const lower = msg.toLowerCase();
+    // Suppress mineflayer/beflayer deprecated event notices about physicTick/physicsTick
+    if (
+      lower.includes('physictick') ||
+      lower.includes('physicsTick'.toLowerCase()) ||
+      (lower.includes('deprecated event') && lower.includes('physic')) ||
+      lower.includes('mineflayer detected') ||
+      lower.includes('beflayer detected')
+    ) return;
+  } catch {}
+  return __originalWarn(...args);
 };
 
 // ── Personality definitions ──────────────────────────────────────────────────
@@ -475,9 +494,17 @@ function renderVoiceCard(v: VoiceDef, selected: boolean): string[] {
   const cornerBL = selected ? '╰' : '└';
   const cornerBR = selected ? '╯' : '┘';
 
+  // Truncate long taglines so they don't overflow the card width
+  const namePart = `${v.glyph}  ${v.name}`;
+  const maxTaglineWidth = width - 8 - visibleLength(namePart);
+  let tagline = v.tagline;
+  if (visibleLength(tagline) > maxTaglineWidth && maxTaglineWidth > 1) {
+    tagline = tagline.slice(0, Math.max(0, maxTaglineWidth - 1)) + '…';
+  }
+
   const titleLine = selected
-    ? `${C.bold}${v.color}${v.glyph}  ${v.name}${C.reset}  ${C.muted}${v.tagline}${C.reset}`
-    : `${v.color}${v.glyph}${C.reset}  ${C.ink}${v.name}${C.reset}  ${C.faint}${v.tagline}${C.reset}`;
+    ? `${C.bold}${v.color}${namePart}${C.reset}  ${C.muted}${tagline}${C.reset}`
+    : `${v.color}${v.glyph}${C.reset}  ${C.ink}${v.name}${C.reset}  ${C.faint}${tagline}${C.reset}`;
 
   const lines: string[] = [];
   lines.push(`${border}${cornerTL}${'─'.repeat(width - 2)}${cornerTR}${C.reset}`);
@@ -500,6 +527,31 @@ async function askVoice(): Promise<VoiceDef | undefined> {
 
   let idx = 0;
   let renderedLineCount = 0;
+
+  const envApiKey = process.env.ELEVENLABS_API_KEY?.trim();
+
+  function previewVoice(i: number) {
+    if (!envApiKey) return;
+    const v = VOICES[i];
+    if (!v) return;
+    const cfg = {
+      apiKey: envApiKey,
+      voiceId: v.id,
+      modelId: process.env.ELEVENLABS_MODEL_ID?.trim() || 'eleven_turbo_v2_5',
+      stability: Number(process.env.ELEVENLABS_STABILITY) || 0.4,
+      similarityBoost: Number(process.env.ELEVENLABS_SIMILARITY_BOOST) || 0.75,
+      streaming: process.env.ELEVENLABS_STREAMING ? process.env.ELEVENLABS_STREAMING === 'true' : true,
+      latency: Math.max(0, Math.min(4, Number(process.env.ELEVENLABS_LATENCY) || 4)),
+    };
+    try {
+      const sp = createElevenLabsSpeaker(cfg, (m) => logSilent(m));
+      void sp.speak(v.tagline);
+    } catch {
+      // ignore preview errors
+    }
+  }
+
+  function logSilent(_: string) { /* no-op: avoid polluting setup UI */ }
 
   function tabs(): string {
     return VOICES.map((v, i) => {
@@ -532,9 +584,11 @@ async function askVoice(): Promise<VoiceDef | undefined> {
       if (key.name === 'right') {
         idx = (idx + 1) % VOICES.length;
         render();
+        previewVoice(idx);
       } else if (key.name === 'left') {
         idx = (idx - 1 + VOICES.length) % VOICES.length;
         render();
+        previewVoice(idx);
       } else if (key.name === 'return' || key.name === 'enter') {
         if (renderedLineCount > 0) clearLines(renderedLineCount);
         if (process.stdin.isTTY) process.stdin.setRawMode(false);
