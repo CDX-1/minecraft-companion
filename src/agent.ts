@@ -211,6 +211,21 @@ const TOOLS: ChatCompletionTool[] = [
       parameters: { type: 'object', properties: {} },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'drop_item',
+      description: 'Drop/toss items from inventory onto the ground',
+      parameters: {
+        type: 'object',
+        required: ['item_name'],
+        properties: {
+          item_name: { type: 'string', description: 'Partial or full item name (e.g. "dirt", "oak_log")' },
+          count: { type: 'number', description: 'How many to drop (default: entire stack)' },
+        },
+      },
+    },
+  },
 ];
 
 export class MinecraftAgent {
@@ -230,7 +245,42 @@ export class MinecraftAgent {
     return this.movements;
   }
 
+  private tryFastPath(message: string, sender: string): string | null {
+    const lower = message.toLowerCase().trim();
+
+    if (/\b(follow me|follow|come with me)\b/.test(lower)) {
+      const target = this.bot.players[sender]?.entity;
+      if (!target) return "I can't see you.";
+      this.bot.pathfinder.setMovements(this.getMovements());
+      this.bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
+      return 'Following you!';
+    }
+
+    if (/\b(stop|halt|stay|wait here)\b/.test(lower)) {
+      this.bot.pathfinder.stop();
+      this.bot.clearControlStates();
+      return 'Stopped.';
+    }
+
+    if (/\b(come here|come to me)\b/.test(lower)) {
+      const target = this.bot.players[sender]?.entity;
+      if (!target) return "I can't see you.";
+      const p = target.position;
+      this.navigateTo(p.x, p.y, p.z, 2).catch(() => {});
+      return 'On my way!';
+    }
+
+    if (/\b(hi|hello|hey)\b/.test(lower)) {
+      return 'Hey!';
+    }
+
+    return null;
+  }
+
   async handleMessage(message: string, sender: string): Promise<string> {
+    const fast = this.tryFastPath(message, sender);
+    if (fast !== null) return fast;
+
     const pos = this.bot.entity?.position;
     const state = pos
       ? `Position: x=${pos.x.toFixed(1)}, y=${pos.y.toFixed(1)}, z=${pos.z.toFixed(1)} | Health: ${(this.bot.health ?? 0).toFixed(0)}/20 | Food: ${this.bot.food ?? 0}/20`
@@ -454,6 +504,15 @@ export class MinecraftAgent {
               : p.username;
           })
           .join(', ');
+      }
+
+      case 'drop_item': {
+        const { item_name, count } = args as { item_name: string; count?: number };
+        const item = bot.inventory.items().find(i => i.name.includes(item_name));
+        if (!item) return `No ${item_name} in inventory`;
+        const dropCount = count ?? item.count;
+        await bot.toss(item.type, null, dropCount);
+        return `Dropped ${dropCount}x ${item.name}`;
       }
 
       default:
