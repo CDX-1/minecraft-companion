@@ -6,6 +6,7 @@ import { parseChatCommand } from './commands';
 import { BotConfig } from './config';
 import { MinecraftAgent } from './agent';
 import { GlobalPushToTalk, startGlobalPushToTalk } from './globalPushToTalk';
+import { createLedStatusController, LedStatusController } from './ledStatus';
 import { createElevenLabsSpeaker, ElevenLabsSpeaker } from './services/elevenLabs';
 import { BuildStatus } from './services/builder';
 import { startVoiceServer, VoiceServer } from './voiceServer';
@@ -95,11 +96,14 @@ export function launchUI(config: BotConfig): void {
   let voiceServer: VoiceServer | null = null;
   let voiceSpeaker: ElevenLabsSpeaker | null = null;
   let globalPushToTalk: GlobalPushToTalk | null = null;
+  let ledStatus: LedStatusController | null = null;
   let agent: MinecraftAgent | null = null;
 
   const openaiApiKey = process.env.OPENAI_API_KEY?.trim();
 
   screen.key(['C-c'], () => {
+    ledStatus?.setStatus('red', 'companion shutting down');
+    ledStatus?.close();
     globalPushToTalk?.close();
     voiceServer?.close();
     process.exit(0);
@@ -134,6 +138,12 @@ export function launchUI(config: BotConfig): void {
     chatLog.log(`{red-fg}[error]{/red-fg} ${message}`);
     screen.render();
   }
+
+  ledStatus = createLedStatusController({
+    log: logSystem,
+    warn: logWarning,
+  });
+  ledStatus.setStatus('yellow', 'companion starting');
 
   function loadPluginSafely(name: string, plugin: Parameters<Bot['loadPlugin']>[0]) {
     try {
@@ -201,6 +211,7 @@ export function launchUI(config: BotConfig): void {
     if (!target) {
       botSay("I can't see you.");
       logWarning(`Could not see ${username} to follow.`);
+      ledStatus?.setStatus('yellow', 'follow target not visible');
       return;
     }
 
@@ -222,6 +233,7 @@ export function launchUI(config: BotConfig): void {
 
           if (!bot?.entity) {
             logWarning('Bot not spawned; voice command ignored.');
+            ledStatus?.setStatus('yellow', 'voice command before spawn');
             return;
           }
 
@@ -232,6 +244,7 @@ export function launchUI(config: BotConfig): void {
               .then((response) => { if (response) botSay(response); })
               .catch((err: Error) => {
                 logError(`agent voice error: ${err.message}`);
+                ledStatus?.setStatus('red', 'agent voice error');
               });
           } else {
             const command = parseChatCommand(text, bot.username);
@@ -242,6 +255,7 @@ export function launchUI(config: BotConfig): void {
               if (config.ownerUsername) followPlayer(config.ownerUsername);
             } else {
               logWarning('No matching voice command.');
+              ledStatus?.setStatus('yellow', 'unknown voice command');
             }
           }
 
@@ -270,10 +284,12 @@ export function launchUI(config: BotConfig): void {
         const message = err instanceof Error ? err.message : String(err);
         logWarning(`Global push-to-talk unavailable: ${message}`);
         logWarning('On macOS, grant Terminal/your editor Accessibility permission, then restart.');
+        ledStatus?.setStatus('yellow', 'push-to-talk unavailable');
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logError(`Failed to start voice server: ${message}`);
+      ledStatus?.setStatus('red', 'voice server failed');
     }
   }
 
@@ -307,6 +323,13 @@ export function launchUI(config: BotConfig): void {
     const food = bot.food ?? 0;
     const pos = bot.entity.position;
     const buildStatus = agent?.getBuildStatus();
+    if ((bot.health ?? 20) <= 6) {
+      ledStatus?.setStatus('red', 'low health');
+    } else if ((bot.food ?? 20) <= 8 || !agent) {
+      ledStatus?.setStatus('yellow', !agent ? 'agent unavailable' : 'low food');
+    } else {
+      ledStatus?.setStatus('green', 'online');
+    }
     infoPanel.setContent(
       `{bold}Link{/bold}\n {green-fg}online{/green-fg} ${config.host}:${config.port}\n\n` +
       `{bold}Callsign{/bold}\n ${bot.username}\n\n` +
@@ -342,6 +365,7 @@ export function launchUI(config: BotConfig): void {
       );
       statusBar.style.bg = 'green';
       logSystem(`Spawned as ${bot.username}.`);
+      ledStatus?.setStatus('yellow', 'spawned, checking systems');
       infoTimer = setInterval(renderInfo, 1000);
       void loadAutoEatSafely();
       void (bot as any).armorManager?.equipAll?.().catch?.(() => undefined);
@@ -372,8 +396,10 @@ export function launchUI(config: BotConfig): void {
           },
         );
         logAgent('GPT-4o-mini ready.');
+        ledStatus?.setStatus('green', 'agent ready');
       } else {
         logWarning('No OPENAI_API_KEY; using basic commands only.');
+        ledStatus?.setStatus('yellow', 'no llm api key');
       }
 
       screen.render();
@@ -409,11 +435,13 @@ export function launchUI(config: BotConfig): void {
         })
         .catch((err: Error) => {
           logError(`agent error: ${err.message}`);
+          ledStatus?.setStatus('red', 'agent error');
         });
     });
 
     bot.on('error', (err) => {
       logError(err.message);
+      ledStatus?.setStatus('red', 'bot error');
       statusBar.setContent(`  Error: ${err.message}`);
       statusBar.style.bg = 'red';
       screen.render();
@@ -421,9 +449,11 @@ export function launchUI(config: BotConfig): void {
 
     bot.on('end', (reason) => {
       if (infoTimer) clearInterval(infoTimer);
+      ledStatus?.setStatus('red', 'bot disconnected');
       globalPushToTalk?.close();
       globalPushToTalk = null;
       voiceServer?.close();
+      ledStatus?.close();
       logWarning(`Disconnected: ${reason}`);
       statusBar.setContent(`  Disconnected: ${reason}`);
       statusBar.style.bg = 'red';
